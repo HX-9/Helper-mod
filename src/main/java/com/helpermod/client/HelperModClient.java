@@ -49,23 +49,37 @@ public class HelperModClient implements ClientModInitializer {
                     || state.getBlock() instanceof EnderChestBlock || state.getBlock() instanceof ShulkerBoxBlock;
 
                 if (isContainer) {
-                    if (FarmAreaManager.getInstance().isAwaitingFertilizerChest()) {
-                        FarmAreaManager.getInstance().setFertilizerChestPos(clickedPos);
-                        FarmAreaManager.getInstance().setAwaitingFertilizerChest(false);
-                        if (player != null) {
-                            player.sendSystemMessage(Component.literal("§a[Bot] تم بنجاح ربط صندوق السماد (Bone Meal) عند: §e" + clickedPos.getX() + ", " + clickedPos.getY() + ", " + clickedPos.getZ() + "§a!"));
-                        }
-                    }
-
-                    String awaitingFarm = FarmAreaManager.getInstance().getAwaitingChestFarm();
-                    if (awaitingFarm != null) {
-                        FarmArea area = FarmAreaManager.getInstance().getArea(awaitingFarm);
-                        if (area != null) {
-                            area.setChestPos(clickedPos);
-                            FarmAreaManager.getInstance().save();
-                            FarmAreaManager.getInstance().setAwaitingChestFarm(null);
+                    FarmAreaManager manager = FarmAreaManager.getInstance();
+                    if (manager.isAwaitingFertilizerChest()) {
+                        FarmArea existingCropFarm = manager.findAreaUsingChest(clickedPos);
+                        if (existingCropFarm != null) {
                             if (player != null) {
-                                player.sendSystemMessage(Component.literal("§a[Bot] تم بنجاح ربط الصندوق عند: §e" + clickedPos.getX() + ", " + clickedPos.getY() + ", " + clickedPos.getZ() + " §aبمزرعة §e" + area.getName() + "§a!"));
+                                player.sendSystemMessage(Component.literal("§c[Bot] هذا الصندوق مخصص لمحاصيل مزرعة §e" + existingCropFarm.getName() + "§c. اختر صندوقاً آخر للسماد (Bone Meal)."));
+                            }
+                        } else {
+                            manager.setFertilizerChestPos(clickedPos);
+                            manager.setAwaitingFertilizerChest(false);
+                            if (player != null) {
+                                player.sendSystemMessage(Component.literal("§a[Bot] تم بنجاح ربط صندوق السماد (Bone Meal) عند: §e" + clickedPos.getX() + ", " + clickedPos.getY() + ", " + clickedPos.getZ() + "§a!"));
+                            }
+                        }
+                    } else {
+                        String awaitingFarm = manager.getAwaitingChestFarm();
+                        if (awaitingFarm != null) {
+                            FarmArea area = manager.getArea(awaitingFarm);
+                            if (area != null) {
+                                if (clickedPos.equals(manager.getFertilizerChestPos())) {
+                                    if (player != null) {
+                                        player.sendSystemMessage(Component.literal("§c[Bot] هذا الصندوق مخصص للسماد (Bone Meal). اختر صندوقاً آخر لمزرعة §e" + area.getName() + "§c."));
+                                    }
+                                } else {
+                                    area.setChestPos(clickedPos);
+                                    manager.save();
+                                    manager.setAwaitingChestFarm(null);
+                                    if (player != null) {
+                                        player.sendSystemMessage(Component.literal("§a[Bot] تم بنجاح ربط الصندوق عند: §e" + clickedPos.getX() + ", " + clickedPos.getY() + ", " + clickedPos.getZ() + " §aبمزرعة §e" + area.getName() + "§a!"));
+                                    }
+                                }
                             }
                         }
                     }

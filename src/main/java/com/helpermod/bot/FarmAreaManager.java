@@ -83,6 +83,9 @@ public class FarmAreaManager {
 
     public void setAwaitingChestFarm(String farmName) {
         this.awaitingChestFarmName = farmName != null ? farmName.toLowerCase() : null;
+        if (this.awaitingChestFarmName != null) {
+            this.awaitingFertilizerChest = false;
+        }
     }
 
     public BlockPos getFertilizerChestPos() {
@@ -94,12 +97,25 @@ public class FarmAreaManager {
         save();
     }
 
+    public FarmArea findAreaUsingChest(BlockPos pos) {
+        if (pos == null) return null;
+        for (FarmArea area : areas.values()) {
+            if (pos.equals(area.getChestPos())) {
+                return area;
+            }
+        }
+        return null;
+    }
+
     public boolean isAwaitingFertilizerChest() {
         return awaitingFertilizerChest;
     }
 
     public void setAwaitingFertilizerChest(boolean awaitingFertilizerChest) {
         this.awaitingFertilizerChest = awaitingFertilizerChest;
+        if (awaitingFertilizerChest) {
+            this.awaitingChestFarmName = null;
+        }
     }
 
     public boolean addArea(String name, BlockPos p1, BlockPos p2, FarmCrop crop) {

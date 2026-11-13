@@ -38,11 +38,7 @@ public class BotCommand {
                     .executes(ctx -> executeSetBotMode(ctx, false)))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("status")
                     .executes(BotCommand::executeBotModeStatus)))
-            // اختصارات سريعة ومباشرة: /bot on و /bot off و /bot stop
-            .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("on")
-                .executes(ctx -> executeSetBotMode(ctx, true)))
-            .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("off")
-                .executes(ctx -> executeSetBotMode(ctx, false)))
+            // إيقاف جميع الأنشطة الجارية سريعاً مع بقاء المود جاهزاً: /bot stop
             .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("stop")
                 .executes(BotCommand::executeStopAll))
             .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("farm")
@@ -78,19 +74,10 @@ public class BotCommand {
                             .executes(BotCommand::executeSetFertilizerChest))
                         .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("clear")
                             .executes(BotCommand::executeClearFertilizerChest))))
-                // /bot farm compost chest [set|clear] (مرادف)
-                .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("compost")
-                    .executes(BotCommand::executeFertilizerChestStatus)
-                    .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("chest")
-                        .executes(BotCommand::executeFertilizerChestStatus)
-                        .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("set")
-                            .executes(BotCommand::executeSetFertilizerChest))
-                        .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("clear")
-                            .executes(BotCommand::executeClearFertilizerChest))))
                 // /bot farm area ...
                 .then(buildAreaCommands())
             )
-            // /bot defend [cautious|combat|off|stop|cancel|status] (أنماط الدفاع)
+            // /bot defend [cautious|combat|on|off|status] (أنماط الدفاع)
             .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("defend")
                 .executes(BotCommand::executeFightStatus)
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("cautious")
@@ -100,10 +87,6 @@ public class BotCommand {
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("on")
                     .executes(ctx -> executeSetFightDefendMode(ctx, FightBotController.DefenseMode.CAUTIOUS)))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("off")
-                    .executes(BotCommand::executeDisableDefenseCompletely))
-                .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("stop")
-                    .executes(BotCommand::executeDisableDefenseCompletely))
-                .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("cancel")
                     .executes(BotCommand::executeDisableDefenseCompletely))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("status")
                     .executes(BotCommand::executeFightStatus)))
@@ -287,14 +270,7 @@ public class BotCommand {
                         }
                         return builder.buildFuture();
                     })
-                    .executes(BotCommand::executeSelectArea)))
-            // setcrop <name> <crop>
-            .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("setcrop")
-                .then(com.mojang.brigadier.builder.RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("name", StringArgumentType.string())
-                    .suggests(areaSuggestions)
-                    .then(com.mojang.brigadier.builder.RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("crop", StringArgumentType.string())
-                        .suggests(cropSuggestions)
-                        .executes(BotCommand::executeSetCrop))));
+                    .executes(BotCommand::executeSelectArea)));
     }
 
     private static int executeStart(CommandContext<FabricClientCommandSource> context) {
@@ -526,36 +502,6 @@ public class BotCommand {
         return 1;
     }
 
-    private static int executeSetCrop(CommandContext<FabricClientCommandSource> context) {
-        String name = StringArgumentType.getString(context, "name").toLowerCase();
-        String cropId = StringArgumentType.getString(context, "crop").toLowerCase();
-
-        FarmArea area = FarmAreaManager.getInstance().getArea(name);
-        if (area == null) {
-            context.getSource().sendFeedback(Component.literal("§c[Bot] لا توجد منطقة بهذا الاسم: §e" + name));
-            return 0;
-        }
-
-        if (cropId.equals("auto") || cropId.equals("تلقائي") || cropId.equals("none")) {
-            area.setTargetCrop(null);
-            FarmAreaManager.getInstance().save();
-            context.getSource().sendFeedback(Component.literal("§a[Bot] تم تعيين المنطقة §e" + name + "§a لتعمل بنمط: §bتلقائي (إعادة زراعة نفس المحصول السابق)."));
-            return 1;
-        }
-
-        FarmCrop crop = FarmCrop.fromId(cropId);
-        if (crop == null) {
-            context.getSource().sendFeedback(Component.literal("§c[Bot] نوع المحصول غير معروف! المحاصيل المتاحة:"));
-            context.getSource().sendFeedback(Component.literal("§ewheat §7(قمح), §ecarrot §7(جزر), §epotato §7(بطاطس), §ebeetroot §7(شمندر), §enether_wart §7(نيذر وارت), أو §eauto §7(تلقائي)"));
-            return 0;
-        }
-
-        area.setTargetCrop(crop);
-        FarmAreaManager.getInstance().save();
-        context.getSource().sendFeedback(Component.literal("§a[Bot] تم تعيين محصول المنطقة §e" + name + "§a إلى: §e" + crop.getArabicName() + " (" + crop.getId() + ")"));
-        return 1;
-    }
-
     private static int executeEditGeneralHelp(CommandContext<FabricClientCommandSource> context) {
         FabricClientCommandSource source = context.getSource();
         source.sendFeedback(Component.literal("§6=== [تعديل المزارع المحفوظة] ==="));
@@ -672,12 +618,16 @@ public class BotCommand {
         Minecraft client = Minecraft.getInstance();
         if (client.player != null) {
             BlockPos playerPos = client.player.blockPosition();
+            BlockPos fertilizerChest = FarmAreaManager.getInstance().getFertilizerChestPos();
             BlockPos targetChest = null;
 
             for (int dx = -1; dx <= 1; dx++) {
                 for (int dy = -1; dy <= 1; dy++) {
                     for (int dz = -1; dz <= 1; dz++) {
                         BlockPos check = playerPos.offset(dx, dy, dz);
+                        if (check.equals(fertilizerChest)) {
+                            continue;
+                        }
                         if (client.level != null) {
                             var state = client.level.getBlockState(check);
                             if (state.getBlock() instanceof net.minecraft.world.level.block.ChestBlock
@@ -695,11 +645,16 @@ public class BotCommand {
             }
 
             if (targetChest == null) {
+                if (playerPos.equals(fertilizerChest)) {
+                    source.sendFeedback(Component.literal("§c[Bot] هذا الموقع مخصص لصندوق السماد (Bone Meal). قف بجانب صندوق آخر أو استخدم /bot farm area edit " + farmName + " chest."));
+                    return 0;
+                }
                 targetChest = playerPos;
             }
 
             area.setChestPos(targetChest);
             FarmAreaManager.getInstance().save();
+            FarmAreaManager.getInstance().setAwaitingChestFarm(null);
             source.sendFeedback(Component.literal("§a[Bot] تم تعيين صندوق مزرعة §e" + farmName + "§a عند: §e" + targetChest.getX() + ", " + targetChest.getY() + ", " + targetChest.getZ()));
             return 1;
         }
@@ -807,11 +762,14 @@ public class BotCommand {
             BlockPos playerPos = client.player.blockPosition();
             BlockPos targetChest = null;
 
-            // فحص المحيط القريب للبحث عن صندوق أو حاوية مجاورة
+            // فحص المحيط القريب للبحث عن صندوق أو حاوية مجاورة مع تجاهل صناديق المحاصيل المخصصة مسبقاً
             for (int dx = -2; dx <= 2; dx++) {
                 for (int dy = -1; dy <= 2; dy++) {
                     for (int dz = -2; dz <= 2; dz++) {
                         BlockPos check = playerPos.offset(dx, dy, dz);
+                        if (FarmAreaManager.getInstance().findAreaUsingChest(check) != null) {
+                            continue;
+                        }
                         if (client.level != null) {
                             var state = client.level.getBlockState(check);
                             if (state.getBlock() instanceof net.minecraft.world.level.block.ChestBlock
@@ -1077,11 +1035,10 @@ public class BotCommand {
     private static void sendHelp(FabricClientCommandSource source) {
         source.sendFeedback(Component.literal("§6=== [أوامر المساعد الآلي - HelperMod] ==="));
         source.sendFeedback(Component.literal("§6/bot mode [on|off|status] §7- تشغيل أو إيقاف المود بالكامل في المطلق (Bot Mode)"));
-        source.sendFeedback(Component.literal("§6/bot on §7| §6/bot off §7- تشغيل/إيقاف وضع البوت العام سريعاً"));
         source.sendFeedback(Component.literal("§6/bot stop §7- إيقاف جميع الأنشطة الحالية للبوت فوراً وتحرير الحركة"));
         source.sendFeedback(Component.literal("§b/bot follow <name> §7- اتباع لاعب بمسار آمن والتمركز خلفه في اليمين بـ 3 بلوكات"));
         source.sendFeedback(Component.literal("§b/bot follow stop §7- إيقاف وضع الاتباع"));
-        source.sendFeedback(Component.literal("§a/bot defend [cautious|combat|off] §7- أنماط الحماية والدفاع (حذر / قتال / إلغاء في المطلق)"));
+        source.sendFeedback(Component.literal("§a/bot defend [cautious|combat|on|off|status] §7- أنماط الحماية والدفاع (حذر / قتال / إيقاف في المطلق)"));
         source.sendFeedback(Component.literal("§a/bot friend add <name> §7- إضافة لاعب كصديق لمنع الحذر والدفاع ضده"));
         source.sendFeedback(Component.literal("§a/bot friend remove <name> §7- إزالة لاعب من قائمة الأصدقاء"));
         source.sendFeedback(Component.literal("§a/bot friend list §7- عرض جميع الأصدقاء المحفوظين"));
@@ -1097,8 +1054,7 @@ public class BotCommand {
         source.sendFeedback(Component.literal("§e/bot farm area pos1 §7- تحديد النقطة الأولى من موقعك"));
         source.sendFeedback(Component.literal("§e/bot farm area pos2 §7- تحديد النقطة الثانية من موقعك"));
         source.sendFeedback(Component.literal("§e/bot farm area create <اسم> [محصول] §7- إنشاء منطقة مع اختيار المحصول"));
-        source.sendFeedback(Component.literal("§e/bot farm area edit <اسم> <name|crop> <قيمة> §7- تعديل اسم أو محصول مزرعة"));
-        source.sendFeedback(Component.literal("§e/bot farm area setcrop <اسم> <المحصول> §7- تخصيص محصول لمزرعة"));
+        source.sendFeedback(Component.literal("§e/bot farm area edit <اسم> <name|crop|chest> [قيمة] §7- تعديل اسم أو محصول أو صندوق مزرعة"));
         source.sendFeedback(Component.literal("§e/bot farm area list §7- عرض جميع المناطق المسجلة"));
         source.sendFeedback(Component.literal("§e/bot farm area remove <اسم> §7- حذف منطقة"));
         source.sendFeedback(Component.literal("§e/bot farm area select [اسم|all] §7- عرض المزارع المتاحة أو تركيز العمل على واحدة"));
