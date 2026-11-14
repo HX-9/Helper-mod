@@ -1,6 +1,7 @@
 package com.helpermod.bot;
 
 import com.helpermod.bot.food.BotFoodManager;
+import com.helpermod.bot.path.BotNavigator;
 import com.helpermod.bot.path.FarmPathfinder;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
@@ -96,6 +97,7 @@ public class FarmBotController {
 
     // مسار التحرك الذكي لتفادي الأسوار والجدران
     private List<BlockPos> currentPath = null;
+    private final BotNavigator waterRescueNavigator = new BotNavigator();
     private BlockPos currentGoal = null;
     private int pathRecalcCooldown = 0;
 
@@ -361,6 +363,7 @@ public class FarmBotController {
         physicalStuckTicks = 0;
         FightBotController.getInstance().stopDefending(client);
         FightBotController.getInstance().releaseEmergencyRun(client);
+        waterRescueNavigator.reset(client);
         if (isDriving) {
             releaseControls(client);
             isDriving = false;
@@ -384,7 +387,21 @@ public class FarmBotController {
         MultiPlayerGameMode gameMode = client.gameMode;
 
         if (player == null || level == null || gameMode == null || player.isDeadOrDying()) {
+            waterRescueNavigator.reset(client);
             return;
+        }
+
+        waterRescueNavigator.tickCooldowns();
+
+        // حراسة التنفس الطارئة في الماء (الطفو أو الهروب من السقف قبل الغرق مع السماح بالغوص الحر)
+        if (!player.isSleeping() || BotNavigator.isEyesInWater(level, player)) {
+            if (player.isSleeping() && BotNavigator.isEyesInWater(level, player) && BotNavigator.getAirRatio(player) <= 0.35) {
+                player.stopSleepInBed(true, true);
+            }
+            if (!player.isSleeping() && waterRescueNavigator.handleUrgentWaterBreathing(client, player, level, gameMode)) {
+                isDriving = true;
+                return;
+            }
         }
 
         // أولاً وقبل أي مهمة أو كولداون أو عمل زراعي: فحص وضع الدفاع ورصد أي تهديد للصد الفوري والمناورة
@@ -407,6 +424,9 @@ public class FarmBotController {
 
         if (cooldownTicks > 0) {
             cooldownTicks--;
+            if (!player.isSleeping()) {
+                BotNavigator.maintainWaterBuoyancy(client, player, level, null);
+            }
             return;
         }
 
@@ -1521,21 +1541,7 @@ public class FarmBotController {
     }
 
     private int findSafeInteractionSlot(LocalPlayer player) {
-        Inventory inv = player.getInventory();
-        // البحث أولاً عن خانة فارغة في شريط الأدوات (Hotbar)
-        for (int i = 0; i < 9; i++) {
-            if (inv.getItem(i).isEmpty()) {
-                return i;
-            }
-        }
-        // البحث عن خانة لا تحتوي على بلوكة ولا فأس شجر لعدم إعاقة التفاعل
-        for (int i = 0; i < 9; i++) {
-            var item = inv.getItem(i).getItem();
-            if (!(item instanceof net.minecraft.world.item.BlockItem) && !(item instanceof net.minecraft.world.item.AxeItem)) {
-                return i;
-            }
-        }
-        return -1;
+        return BotEquipmentHelper.findSafeInteractionSlot(player);
     }
 
     private boolean isBlockedByFenceOrWall(LocalPlayer player, ClientLevel level) {
@@ -1612,17 +1618,21 @@ public class FarmBotController {
             client.options.keyUp.setDown(false);
             client.options.keySprint.setDown(false);
             player.setSprinting(false);
+            BotNavigator.maintainWaterBuoyancy(client, player, level, null);
             isDriving = false;
             return;
         }
 
         isDriving = true;
 
-        boolean inWater = player.isInWater() || level.getBlockState(player.blockPosition()).is(Blocks.WATER);
+        boolean inWater = BotNavigator.isEntityInWater(level, player);
 
         if (inWater) {
-            // السباحة فوق سطح الماء دون غرق
-            client.options.keyJump.setDown(true);
+            // السباحة والطفو الآمن في المياه العميقة مع القفز فقط عند الاصطدام بضفة الخروج
+            BotNavigator.maintainWaterBuoyancy(client, player, level, null);
+            if (player.horizontalCollision) {
+                client.options.keyJump.setDown(true);
+            }
             client.options.keySprint.setDown(true);
         }
 

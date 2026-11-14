@@ -1,6 +1,7 @@
 package com.helpermod.bot;
 import com.helpermod.bot.combat.BotCombatManager;
 import com.helpermod.bot.food.BotFoodManager;
+import com.helpermod.bot.path.BotNavigator;
 import com.helpermod.bot.path.FarmPathfinder;
 
 import net.minecraft.client.Minecraft;
@@ -10,21 +11,21 @@ import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.network.chat.Component;
-import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.player.Player;
-import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
-import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.BedBlock;
 import net.minecraft.world.level.block.DoorBlock;
 import net.minecraft.world.level.block.FenceGateBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.VoxelShape;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -59,28 +60,30 @@ public class BotFollowController {
     // موضع تثبيت الصديق عند الاستقرار لمراقبة هل تحركت أقدامه أم التفت فقط
     private Vec3 companionAnchorPos = null;
 
-    // مسار A* للوصول الآمن وتفادي العوائق
-    private List<BlockPos> currentSafePath = new ArrayList<>();
-    private BlockPos lastGoalPos = null;
-    private int pathRecalcCooldown = 0;
+    // الملاح الموحد (A* + فتح الأبواب + فحص المخاطر والسقوط)
+    private final BotNavigator navigator = new BotNavigator();
 
-    // كاشف ومناور العلوق الذكي (Smart Anti-Stuck System)
-    private Vec3 lastStuckCheckPos = null;
-    private int stuckTicks = 0;
-    private int strafeTicks = 0;
-    private boolean strafeRight = true;
-
-    // عدادات الاستقرار والتفاعل
+    // عدادات الاستقرار والأكل
     private int companionStationaryTicks = 0;
-    private int doorInteractCooldown = 0;
 
     // الأولوية رقم 1: نظام الأكل والعلاج الذاتي التلقائي أثناء الاتباع
     private boolean isEatingWhileFollowing = false;
     private int followEatingTicks = 0;
     private int lastFollowFoodLevel = -1;
     private int hungryAlertCooldown = 0;
-    private int moveJumpCooldown = 0;
     private int followEatSuppressionTicks = 0;
+    private int preEatWeaponSlot = -1;
+
+    // حالة النوم بجانب القائد عند استلقائه وتوفر سرير قريب متاح
+    private BlockPos targetSleepBedPos = null;
+    private int sleepScanCooldown = 0;
+    private int sleepInteractCooldown = 0;
+    private int sleepAttemptCount = 0;
+    private final Map<BlockPos, Integer> failedBedCooldowns = new HashMap<>();
+    private boolean sleepingWithCompanion = false;
+    private int preSleepSlot = -1;
+    private int sleepReenterCooldown = 0;
+    private boolean sleepMessageSent = false;
 
     private BotFollowController() {}
 
@@ -126,18 +129,15 @@ public class BotFollowController {
         this.following = true;
         this.currentState = FollowState.SPRINT_FROM_DISTANCE;
         this.companionAnchorPos = null;
-        this.currentSafePath.clear();
-        this.lastGoalPos = null;
-        this.stuckTicks = 0;
-        this.strafeTicks = 0;
-        this.lastStuckCheckPos = null;
+        this.navigator.reset(client);
         this.companionStationaryTicks = 0;
         this.isEatingWhileFollowing = false;
         this.followEatingTicks = 0;
         this.lastFollowFoodLevel = -1;
         this.hungryAlertCooldown = 0;
-        this.moveJumpCooldown = 0;
         this.followEatSuppressionTicks = 0;
+        this.preEatWeaponSlot = -1;
+        this.resetSleepState();
 
         // تصفير أي قتال أو دفاع معلق في الكنترولر القتالي
         BotCombatManager.getInstance().resetCombat(client);
@@ -172,16 +172,19 @@ public class BotFollowController {
         this.targetPlayerUUID = null;
         this.currentState = FollowState.SPRINT_FROM_DISTANCE;
         this.companionAnchorPos = null;
-        this.currentSafePath.clear();
-        this.lastGoalPos = null;
-        this.stuckTicks = 0;
-        this.strafeTicks = 0;
+        this.navigator.reset(client);
+        this.companionStationaryTicks = 0;
         this.isEatingWhileFollowing = false;
         this.followEatingTicks = 0;
         this.lastFollowFoodLevel = -1;
         this.hungryAlertCooldown = 0;
-        this.moveJumpCooldown = 0;
         this.followEatSuppressionTicks = 0;
+        this.preEatWeaponSlot = -1;
+        if (client != null && client.player != null && sleepingWithCompanion && client.player.isSleeping()) {
+            client.player.stopSleepInBed(true, true);
+            restorePostSleepWeapon(client.player, client.gameMode);
+        }
+        this.resetSleepState();
 
         BotCombatManager.getInstance().resetCombat(client);
         releaseMovement(client);
@@ -211,56 +214,129 @@ public class BotFollowController {
         MultiPlayerGameMode gameMode = client.gameMode;
 
         if (player == null || level == null || player.isDeadOrDying()) {
+            resetSleepState();
             releaseMovement(client);
             return;
         }
 
-        if (doorInteractCooldown > 0) doorInteractCooldown--;
-        if (pathRecalcCooldown > 0) pathRecalcCooldown--;
+        navigator.tickCooldowns();
 
         Player companion = findTargetPlayer(level);
         if (companion == null) {
+            if (sleepingWithCompanion && player.isSleeping()) {
+                player.stopSleepInBed(true, true);
+                restorePostSleepWeapon(player, gameMode);
+            }
+            resetSleepState();
             releaseMovement(client);
             return;
         }
         this.targetPlayerUUID = companion.getUUID();
 
         if (hungryAlertCooldown > 0) hungryAlertCooldown--;
-        if (moveJumpCooldown > 0) moveJumpCooldown--;
         if (followEatSuppressionTicks > 0) followEatSuppressionTicks--;
+        if (sleepScanCooldown > 0) sleepScanCooldown--;
+        if (sleepInteractCooldown > 0) sleepInteractCooldown--;
+        if (sleepReenterCooldown > 0) sleepReenterCooldown--;
+        failedBedCooldowns.entrySet().removeIf(entry -> {
+            int rem = entry.getValue() - 1;
+            if (rem <= 0) return true;
+            entry.setValue(rem);
+            return false;
+        });
 
         // تحرير القفز التلقائي فوراً بمجرد الارتفاع عن الأرض في الهواء لمنع تكرار القفز العشوائي
-        boolean inWater = player.isInWater() || level.getBlockState(player.blockPosition()).is(Blocks.WATER);
+        boolean inWater = BotNavigator.isEntityInWater(level, player);
         if (!player.onGround() && !inWater) {
             client.options.keyJump.setDown(false);
         }
 
-        // حساب المسافات بدقة لتنظيم مصفوفة الأولويات الثلاث
+        // حساب المسافة ثلاثية الأبعاد وفرق الارتفاع لضمان اللحاق بالقائد عند صعوده أو نزوله
         double dx = player.getX() - companion.getX();
+        double dy = player.getY() - companion.getY();
         double dz = player.getZ() - companion.getZ();
-        double distToCompanion = Math.sqrt(dx * dx + dz * dz);
+        double distXZ = Math.sqrt(dx * dx + dz * dz);
+        double dist3D = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        double verticalGap = Math.abs(dy);
+
+        // ==============================================================
+        // الأولوية 0: حراسة التنفس الطارئة في الماء (الطفو أو الهروب من السقف قبل الغرق مع السماح بالغوص الحر)
+        // ==============================================================
+        if (player.isSleeping() && BotNavigator.isEyesInWater(level, player) && BotNavigator.getAirRatio(player) <= 0.35) {
+            player.stopSleepInBed(true, true);
+            restorePostSleepWeapon(player, gameMode);
+            resetSleepState();
+        }
+        if (navigator.handleUrgentWaterBreathing(client, player, level, gameMode)) {
+            stopFollowEating(client, player, gameMode);
+            navigator.clearPathOnly();
+            return;
+        }
+
+        // إدارة حالة النوم المتزامن مع القائد (البقاء نائماً معه أو الاستيقاظ فور قيامه)
+        boolean companionSleeping = companion.isSleeping();
+        if (!companionSleeping) {
+            if (sleepingWithCompanion || targetSleepBedPos != null || preSleepSlot != -1) {
+                if (sleepingWithCompanion && player.isSleeping()) {
+                    player.stopSleepInBed(true, true);
+                }
+                restorePostSleepWeapon(player, gameMode);
+                resetSleepState();
+            }
+        } else if (player.isSleeping()) {
+            sleepingWithCompanion = true;
+            sleepReenterCooldown = 0;
+            targetSleepBedPos = null;
+            sleepAttemptCount = 0;
+            stopFollowEating(client, player, gameMode);
+            navigator.clearPathOnly();
+            releaseMovement(client);
+            if (client.options != null) {
+                client.options.keyUse.setDown(false);
+            }
+            return;
+        } else if (sleepingWithCompanion) {
+            // البوت استيقظ للتو (غالباً لتخطي الليل أو تلقّي ضربة): ننتظر وجيزاً قبل إعادة المحاولة حتى يستيقظ القائد أيضاً
+            sleepingWithCompanion = false;
+            sleepReenterCooldown = 25;
+            restorePostSleepWeapon(player, gameMode);
+        }
+
+        // ==============================================================
+        // الأولوية 0: حراسة التنفس الطارئة في الماء (الطفو أو الهروب من السقف قبل الغرق مع السماح بالغوص الحر)
+        // ==============================================================
+        if (navigator.handleUrgentWaterBreathing(client, player, level, gameMode)) {
+            stopFollowEating(client, player, gameMode);
+            navigator.clearPathOnly();
+            return;
+        }
 
         // ==============================================================
         // الأولوية 1: القتال والدفاع التكتيكي الحاسم (Combat & Defense)
         // ==============================================================
-        // تفويض كامل لمنطق القتال المتخصص BotCombatManager لفصل القتال عن الملاحة
-        boolean engagedInCombat = BotCombatManager.getInstance().tickCombat(client, player, level, gameMode, companion, distToCompanion);
+        boolean engagedInCombat = BotCombatManager.getInstance().tickCombat(client, player, level, gameMode, companion, dist3D);
         if (engagedInCombat) {
-            // أثناء القتال النشط، نوقف الأكل فوراً ونترك السيطرة الحركية والقتالية التامة لمنسق المعارك
             stopFollowEating(client, player, gameMode);
+            navigator.clearPathOnly();
+            return;
+        }
+
+        // ==============================================================
+        // الأولوية 1.5: النوم بجوار القائد إذا نام وكان بجواره سرير متاح
+        // ==============================================================
+        if (companionSleeping && sleepReenterCooldown <= 0
+            && handleSleepWithCompanion(client, player, level, gameMode, companion)) {
             return;
         }
 
         // ==============================================================
         // الأولوية 2: اللحاق بالقائد والتمركز الصحيح (Follow Catch-up)
         // ==============================================================
-        // إذا ابتعد القائد (> 4.5 بلوكات): نوقف الأكل فوراً ونعطي الأولوية الكاملة للركض واللحاق به!
-        if (distToCompanion > 4.5) {
+        if (dist3D > 4.5) {
             if (isEatingWhileFollowing) {
                 stopFollowEating(client, player, gameMode);
-                followEatSuppressionTicks = 35; // مهلة منع العودة السريعة للأكل لمنع التذبذب والبطء
+                followEatSuppressionTicks = 35;
             }
-            // خفض الدرع وإيقاف استخدام أي عنصر فوراً لتمكين الركض السريع (Sprint) بكامل السرعة
             if (client.options.keyUse.isDown()) {
                 client.options.keyUse.setDown(false);
             }
@@ -273,12 +349,9 @@ public class BotFollowController {
         // ==============================================================
         // الأولوية 3: تناول الطعام والعلاج التلقائي (Safe Eating & Healing)
         // ==============================================================
-        // يأكل فقط إذا كان في نطاق آمن ومريح ومستقر بجوار القائد (<= 4.0 بلوكات)، ولا توجد معارك، وانتهت مهلة المنع
-        if (!engagedInCombat && distToCompanion <= 4.0 && followEatSuppressionTicks <= 0) {
+        if (!engagedInCombat && dist3D <= 4.0 && followEatSuppressionTicks <= 0) {
             handleFollowEating(client, player, gameMode);
         }
-
-        boolean busyDefending = false;
 
         // فحص هل الصديق تحركت أقدامه فعلياً من مكانه أم أنه واقف ويلتفت فقط
         boolean companionStepped = companionAnchorPos == null
@@ -291,278 +364,70 @@ public class BotFollowController {
         }
 
         // أ) إذا ابتعد القائد مسافة (> 5.5 بلوكات): الركض السريع الفوري نحو القائد دون تأخير!
-        if (distToCompanion > 5.5) {
+        if (dist3D > 5.5) {
             currentState = FollowState.SPRINT_FROM_DISTANCE;
             companionAnchorPos = null;
         }
 
+        double waterAwareGapLimit = inWater ? 0.85 : 1.8;
+
         switch (currentState) {
             case SPRINT_FROM_DISTANCE: {
-                // إذا اقترب البوت من القائد (<= 3.2 بلوكة)، ننهي الركض البعيد وننتقل فوراً للمرافقة المرنة
-                if (distToCompanion <= 3.2) {
+                if (distXZ <= 3.2 && verticalGap <= waterAwareGapLimit) {
                     currentState = FollowState.FLEXIBLE_ESCORT;
                     releaseMovement(client);
+                    BotNavigator.maintainWaterBuoyancy(client, player, level, companion);
                     break;
                 }
 
-                // الركض السريع المباشر نحو موضع القائد الحالي
                 Vec3 targetPos = companion.position();
-                smartNavigateTo(client, player, level, gameMode, targetPos, true, 2.5, busyDefending);
+                navigator.navigateTo(client, player, level, gameMode, targetPos, true, 2.5, isEatingWhileFollowing, 45.0f, true, 4000);
                 break;
             }
 
             case STATIONARY_MATCHING: {
-                // حالة الاستقرار: إذا تحرك القائد أو ابتعدت المسافة عن 3.4 بلوكات، نخرج فوراً ونلحق به!
-                if (companionStepped || distToCompanion > 3.4) {
+                if (companionStepped || distXZ > 3.4 || verticalGap > waterAwareGapLimit) {
                     currentState = FollowState.FLEXIBLE_ESCORT;
                     companionAnchorPos = null;
                     break;
                 }
 
-                // البوت يظل ثابتاً في مكانه ولا يتحرك إن كان القائد لم يتحرك
                 releaseMovement(client);
-
-                // ثم ينظر لنفس المكان الذي ينظر إليه صديقه
-                if (!busyDefending) {
-                    smoothLookTowards(player, companion.getYRot(), companion.getXRot(), 18.0f);
-                }
+                BotNavigator.maintainWaterBuoyancy(client, player, level, companion);
+                smoothLookTowards(player, companion.getYRot(), companion.getXRot(), 18.0f);
                 break;
             }
 
             case FLEXIBLE_ESCORT: {
-                // إذا توقف القائد لأكثر من ثانيتين ومسافته قريبة ومستقرة، نستقر ونطابق النظر
-                if (!companionStepped && companionStationaryTicks >= 40 && distToCompanion <= 3.6) {
+                if (!companionStepped && companionStationaryTicks >= 40 && distXZ <= 3.6 && verticalGap <= waterAwareGapLimit) {
                     currentState = FollowState.STATIONARY_MATCHING;
                     companionAnchorPos = companion.position();
                     releaseMovement(client);
-                    if (!busyDefending) {
-                        smoothLookTowards(player, companion.getYRot(), companion.getXRot(), 20.0f);
-                    }
+                    BotNavigator.maintainWaterBuoyancy(client, player, level, companion);
+                    smoothLookTowards(player, companion.getYRot(), companion.getXRot(), 20.0f);
                     return;
                 }
 
-                // الحفاظ على مسافة طبيعية ومريحة (~2.8 بلوكة) من القائد
-                if (distToCompanion < 2.2) {
-                    // قريب جداً: التوقف حتى لا يصطدم به أو يدفعه
+                // إذا كان القائد فوق/تحت البوت بفرق ارتفاع ملحوظ، نستهدف موقعه لإيجاد الدرج أو المسار الرأسي أو الغوص/الصعود المائي
+                if (verticalGap > waterAwareGapLimit) {
+                    Vec3 climbTarget = distXZ <= 3.2 ? companion.position() : calculateFlexibleEscortPos(player, companion, level);
+                    boolean sprint = dist3D > 4.5;
+                    navigator.navigateTo(client, player, level, gameMode, climbTarget, sprint, distXZ <= 3.2 ? (inWater ? 0.9 : 2.0) : 0.8, isEatingWhileFollowing, 45.0f, true, 4000);
+                } else if (distXZ < 2.2) {
                     releaseMovement(client);
-                    if (!busyDefending) {
-                        smoothLookTowards(player, companion.getYRot(), companion.getXRot(), 15.0f);
-                    }
-                } else if (distToCompanion > 3.2) {
-                    // القائد ابتعد: الاقتراب منه فوراً
+                    BotNavigator.maintainWaterBuoyancy(client, player, level, companion);
+                    smoothLookTowards(player, companion.getYRot(), companion.getXRot(), 15.0f);
+                } else if (distXZ > 3.2) {
                     Vec3 escortTarget = calculateFlexibleEscortPos(player, companion, level);
-                    boolean sprint = distToCompanion > 4.5;
-                    smartNavigateTo(client, player, level, gameMode, escortTarget, sprint, 0.5, busyDefending);
+                    boolean sprint = distXZ > 4.5;
+                    navigator.navigateTo(client, player, level, gameMode, escortTarget, sprint, 0.7, isEatingWhileFollowing, 45.0f, true, 4000);
                 } else {
-                    // المسافة ممتازة
                     releaseMovement(client);
-                    if (!busyDefending) {
-                        smoothLookTowards(player, companion.getYRot(), companion.getXRot(), 15.0f);
-                    }
+                    BotNavigator.maintainWaterBuoyancy(client, player, level, companion);
+                    smoothLookTowards(player, companion.getYRot(), companion.getXRot(), 15.0f);
                 }
                 break;
             }
-        }
-    }
-
-    /**
-     * الملاحة الذكية وفك العلوق التلقائي (Smart Navigation & Anti-Stuck)
-     */
-    private void smartNavigateTo(Minecraft client, LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode, Vec3 destination, boolean allowSprint, double stopDist, boolean busyDefending) {
-        // فحص الوصول للهدف النهائي: نتوقف فقط إذا وصلنا للمسافة المطلوبة من الهدف النهائي الفعلي وليس من نقاط المسار
-        double finalDx = destination.x - player.getX();
-        double finalDz = destination.z - player.getZ();
-        double distToFinalSq = finalDx * finalDx + finalDz * finalDz;
-        if (distToFinalSq <= stopDist * stopDist) {
-            releaseMovement(client);
-            currentSafePath.clear();
-            lastGoalPos = null;
-            return;
-        }
-
-        BlockPos goalPos = BlockPos.containing(destination.x, destination.y, destination.z);
-
-        // 1. كاشف العلوق الذكي (Stuck Detection)
-        if (lastStuckCheckPos == null) {
-            lastStuckCheckPos = player.position();
-        } else {
-            double movedDist = player.position().distanceTo(lastStuckCheckPos);
-            if (movedDist < 0.08) {
-                stuckTicks++;
-            } else {
-                stuckTicks = 0;
-                strafeTicks = 0;
-                lastStuckCheckPos = player.position();
-            }
-        }
-
-        // 2. معالجة وفك العلوق بمناورات ذكية
-        if (stuckTicks >= 12) {
-            // فحص وفتح أي أبواب أو بوابات سياج مغلقة أمامه
-            checkAndOpenDoors(client, player, level, gameMode);
-
-            // قفزة ذكية لتخطي العائق إن كان هناك عائق حقيقي وسالك فوقه
-            boolean hasObs = isObstacleDirectlyAhead(player, level, destination.x, destination.z)
-                          || hasStepDirectlyAhead(player, level, destination.x, destination.z);
-            if (player.onGround() && hasObs && isCeilingClear(level, player.blockPosition()) && moveJumpCooldown <= 0) {
-                client.options.keyJump.setDown(true);
-                moveJumpCooldown = 12;
-            } else {
-                client.options.keyJump.setDown(false);
-            }
-
-            // مناورة جانبية (Strafing) لتخطي الزوايا
-            strafeTicks++;
-            if (strafeRight) {
-                client.options.keyRight.setDown(true);
-                client.options.keyLeft.setDown(false);
-            } else {
-                client.options.keyLeft.setDown(true);
-                client.options.keyRight.setDown(false);
-            }
-
-            if (strafeTicks > 8) {
-                strafeRight = !strafeRight;
-                strafeTicks = 0;
-            }
-
-            if (stuckTicks >= 24) {
-                // علوق مستمر: إعادة حساب مسار A* بديل فوراً
-                currentSafePath.clear();
-                lastGoalPos = null;
-                pathRecalcCooldown = 0;
-                stuckTicks = 0;
-                client.options.keyJump.setDown(false);
-            }
-        } else {
-            client.options.keyLeft.setDown(false);
-            client.options.keyRight.setDown(false);
-        }
-
-        // 3. تخطيط المسار الآمن بواسطة A*
-        boolean needNewPath = currentSafePath.isEmpty() || (pathRecalcCooldown <= 0 && (lastGoalPos == null || goalPos.distSqr(lastGoalPos) > 9.0));
-        if (needNewPath && pathRecalcCooldown <= 0) {
-            lastGoalPos = goalPos;
-            pathRecalcCooldown = 10;
-            List<BlockPos> path = FarmPathfinder.findPath(level, player.blockPosition(), goalPos, 3000);
-            if (path != null && !path.isEmpty()) {
-                currentSafePath = new ArrayList<>(path);
-            }
-        }
-
-        // 4. الحركة نحو العقدة التالية أو الهدف المباشر
-        Vec3 nextTarget = destination;
-        if (!currentSafePath.isEmpty()) {
-            // تنعيم المسار: إذا كان البوت بالفعل عند أو أقرب للعقدة التالية (node 1)، نتخطى العقدة 0 لمنع الالتفاف للخلف
-            if (currentSafePath.size() >= 2) {
-                BlockPos node1 = currentSafePath.get(1);
-                double d1x = player.getX() - (node1.getX() + 0.5);
-                double d1z = player.getZ() - (node1.getZ() + 0.5);
-                if (d1x * d1x + d1z * d1z < (allowSprint ? 2.5 : 1.5) && Math.abs(player.getY() - node1.getY()) < 1.5) {
-                    currentSafePath.remove(0);
-                }
-            }
-
-            BlockPos nextNode = currentSafePath.get(0);
-            double nx = nextNode.getX() + 0.5;
-            double ny = nextNode.getY();
-            double nz = nextNode.getZ() + 0.5;
-
-            double ndx = player.getX() - nx;
-            double ndz = player.getZ() - nz;
-            double reachThreshold = allowSprint ? 1.44 : 0.8;
-            if (ndx * ndx + ndz * ndz < reachThreshold && Math.abs(player.getY() - ny) < 1.5) {
-                currentSafePath.remove(0);
-                if (!currentSafePath.isEmpty()) {
-                    nextNode = currentSafePath.get(0);
-                    nx = nextNode.getX() + 0.5;
-                    ny = nextNode.getY();
-                    nz = nextNode.getZ() + 0.5;
-                    nextTarget = new Vec3(nx, ny, nz);
-                } else {
-                    nextTarget = destination;
-                }
-            } else {
-                nextTarget = new Vec3(nx, ny, nz);
-            }
-        }
-
-        executeMove(client, player, level, gameMode, nextTarget.x, nextTarget.y, nextTarget.z, allowSprint, busyDefending);
-    }
-
-    /**
-     * تنفيذ الحركة وضبط الأزرار والنظر
-     */
-    private void executeMove(Minecraft client, LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode, double tx, double ty, double tz, boolean sprint, boolean busyDefending) {
-        double dx = tx - player.getX();
-        double dz = tz - player.getZ();
-        double distSq = dx * dx + dz * dz;
-
-        if (distSq < 0.04) {
-            client.options.keyUp.setDown(false);
-            client.options.keySprint.setDown(false);
-            player.setSprinting(false);
-            return;
-        }
-
-        // إذا كان البوت في حالة دفاع نشطة بالدرع، نترك التحكم الحركي الكامل لـ FightBotController
-        if (busyDefending) {
-            return;
-        }
-
-        lookAt(player, tx, player.getEyeY(), tz);
-
-        // تجنب الدوس على التوت الحلو أثناء المشي المباشر
-        double moveDirX = tx - player.getX();
-        double moveDirZ = tz - player.getZ();
-        double moveLen = Math.sqrt(moveDirX * moveDirX + moveDirZ * moveDirZ);
-        if (moveLen > 0.1) {
-            double normX = moveDirX / moveLen;
-            double normZ = moveDirZ / moveLen;
-            BlockPos aheadFeet = BlockPos.containing(player.getX() + normX * 0.75, player.getY() + 0.1, player.getZ() + normZ * 0.75);
-            BlockPos aheadFloor = aheadFeet.below();
-            if (level.getBlockState(aheadFeet).is(Blocks.SWEET_BERRY_BUSH) || level.getBlockState(aheadFloor).is(Blocks.SWEET_BERRY_BUSH)) {
-                // شجيرة توت أمام البوت مباشرة: إيقاف التقدم المباشر وإعادة تخطيط مسار A* آمن فوراً للالتفاف حولها
-                client.options.keyUp.setDown(false);
-                client.options.keySprint.setDown(false);
-                player.setSprinting(false);
-                pathRecalcCooldown = 0;
-                currentSafePath.clear();
-                lastGoalPos = null;
-                return;
-            }
-        }
-
-        client.options.keyUp.setDown(true);
-        boolean canSprint = sprint && !isEatingWhileFollowing && player.getFoodData().getFoodLevel() > 6;
-        client.options.keySprint.setDown(canSprint);
-        player.setSprinting(canSprint);
-
-        // قفز احترافي بنظام النبضة الواحدة (Single Pulse & Cooldown) لمنع كثرة القفز والتعليق:
-        if (moveJumpCooldown > 0) moveJumpCooldown--;
-
-        // التعامل مع الماء
-        boolean inWater = player.isInWater() || level.getBlockState(player.blockPosition()).is(Blocks.WATER);
-        if (inWater) {
-            client.options.keyJump.setDown(true);
-            client.options.keySprint.setDown(true);
-            return;
-        }
-
-        boolean isNodeUp = !currentSafePath.isEmpty() && (ty - player.getY() >= 0.45);
-        boolean ceilingOk = isCeilingClear(level, player.blockPosition());
-        boolean obstacleAhead = isObstacleDirectlyAhead(player, level, tx, tz) || hasStepDirectlyAhead(player, level, tx, tz);
-
-        // يقفز فقط إذا كانت هناك عقدة مسار صاعدة، أو عائق أمامي صلب وسالك فوقه، وكان على الأرض، ولم يقفز لتوه
-        boolean needsJump = (isNodeUp || obstacleAhead) && player.onGround() && ceilingOk && moveJumpCooldown <= 0;
-
-        if (needsJump) {
-            client.options.keyJump.setDown(true);
-            moveJumpCooldown = 10; // مهلة كافية لصعود البلوكة والهبوط دون تكرار القفز العشوائي
-            checkAndOpenDoors(client, player, level, gameMode);
-        } else {
-            // تحرير زر القفز فوراً بمجرد الارتفاع عن الأرض أو عدم وجود عائق لمنع تكرار القفز العبثي
-            client.options.keyJump.setDown(false);
         }
     }
 
@@ -584,20 +449,11 @@ public class BotFollowController {
             dir = new Vec3(Math.sin(rad), 0, -Math.cos(rad));
         }
 
-        // النقطة المستهدفة على بعد 2.8 بلوكة
+        // النقطة المستهدفة على بعد 2.8 بلوكة مع بديل آمن من الجوار أو موضع القائد
         double targetX = companion.getX() + dir.x * 2.8;
         double targetZ = companion.getZ() + dir.z * 2.8;
-        double targetY = companion.getY();
-
-        BlockPos base = BlockPos.containing(targetX, targetY, targetZ);
-        for (int dy : new int[]{0, 1, -1, 2, -2}) {
-            BlockPos test = base.above(dy);
-            if (isSafeStandPosition(level, test)) {
-                return new Vec3(test.getX() + 0.5, test.getY(), test.getZ() + 0.5);
-            }
-        }
-
-        return new Vec3(targetX, targetY, targetZ);
+        BlockPos base = BlockPos.containing(targetX, companion.getY(), targetZ);
+        return findNearestSafeStandPos(level, base, companion.position());
     }
 
     /**
@@ -612,9 +468,11 @@ public class BotFollowController {
 
         double targetX = companion.getX() + offsetX;
         double targetZ = companion.getZ() + offsetZ;
-        double baseY = companion.getY();
+        BlockPos basePos = BlockPos.containing(targetX, companion.getY(), targetZ);
+        return findNearestSafeStandPos(level, basePos, new Vec3(targetX, companion.getY(), targetZ));
+    }
 
-        BlockPos basePos = BlockPos.containing(targetX, baseY, targetZ);
+    private static Vec3 findNearestSafeStandPos(ClientLevel level, BlockPos basePos, Vec3 fallback) {
         int[] yOffsets = {0, 1, -1, 2, -2};
         for (int dy : yOffsets) {
             BlockPos cand = basePos.above(dy);
@@ -623,7 +481,6 @@ public class BotFollowController {
             }
         }
 
-        // فحص النقاط المجاورة القريبة إن كان هناك جدار
         for (int ox = -1; ox <= 1; ox++) {
             for (int oz = -1; oz <= 1; oz++) {
                 if (ox == 0 && oz == 0) continue;
@@ -635,127 +492,49 @@ public class BotFollowController {
                 }
             }
         }
-
-        return new Vec3(targetX, baseY, targetZ);
+        return fallback;
     }
 
     /**
      * فحص هل سقف الغرفة سالك للقفز دون ارتطام الرأس
      */
     public static boolean isCeilingClear(ClientLevel level, BlockPos pos) {
-        return FarmPathfinder.isPassable(level, pos.above(2));
+        return BotNavigator.isCeilingClear(level, pos);
     }
 
     /**
      * فحص هل يوجد عائق صلب حقيقي بارتفاع بلوكة واحدة أمام قدمي البوت في اتجاه هدفه وسالك فوقه للصعود
      */
-    @SuppressWarnings("deprecation")
     public static boolean isObstacleDirectlyAhead(LocalPlayer player, ClientLevel level, double tx, double tz) {
-        if (!player.horizontalCollision) return false;
-        double dx = tx - player.getX();
-        double dz = tz - player.getZ();
-        double len = Math.sqrt(dx * dx + dz * dz);
-        if (len < 0.05) return false;
-
-        double dirX = dx / len;
-        double dirZ = dz / len;
-
-        BlockPos aheadPos = BlockPos.containing(player.getX() + dirX * 0.75, player.getY() + 0.2, player.getZ() + dirZ * 0.75);
-        BlockState aheadState = level.getBlockState(aheadPos);
-        if (aheadState.isAir() || !aheadState.blocksMotion() || FarmPathfinder.isFenceOrWall(aheadState)) {
-            return false;
-        }
-
-        BlockPos aboveAhead = aheadPos.above();
-        BlockPos aboveAboveAhead = aheadPos.above(2);
-        return FarmPathfinder.isPassable(level, aboveAhead) && FarmPathfinder.isPassable(level, aboveAboveAhead);
+        return BotNavigator.isObstacleDirectlyAhead(player, level, tx, tz);
     }
 
     /**
      * فحص هل توجد درجة أو حافة بارتفاع بلوكة أمام البوت مباشرة وسالكة فوقها للصعود السلس دون انتظار التصادم
      */
-    @SuppressWarnings("deprecation")
     public static boolean hasStepDirectlyAhead(LocalPlayer player, ClientLevel level, double tx, double tz) {
-        double dx = tx - player.getX();
-        double dz = tz - player.getZ();
-        double distXZ = Math.sqrt(dx * dx + dz * dz);
-        if (distXZ < 0.1) return false;
-        double normX = dx / distXZ;
-        double normZ = dz / distXZ;
-
-        BlockPos currentFoot = player.blockPosition();
-        BlockPos aheadFoot = BlockPos.containing(player.getX() + normX * 0.75, player.getY() + 0.1, player.getZ() + normZ * 0.75);
-        if (aheadFoot.equals(currentFoot)) {
-            aheadFoot = BlockPos.containing(player.getX() + normX * 1.1, player.getY() + 0.1, player.getZ() + normZ * 1.1);
-        }
-        if (aheadFoot.equals(currentFoot)) return false;
-
-        BlockState footState = level.getBlockState(aheadFoot);
-        if (!footState.isAir() && footState.blocksMotion() && !FarmPathfinder.isFenceOrWall(footState)) {
-            BlockPos aboveFoot = aheadFoot.above();
-            BlockPos aboveAboveFoot = aheadFoot.above(2);
-            return FarmPathfinder.isPassable(level, aboveFoot) && FarmPathfinder.isPassable(level, aboveAboveFoot);
-        }
-        return false;
+        return BotNavigator.hasStepDirectlyAhead(player, level, tx, tz);
     }
 
     /**
      * التحقق من سلامة موقع الوقوف
      */
     private static boolean isSafeStandPosition(ClientLevel level, BlockPos pos) {
-        if (!FarmPathfinder.isPassable(level, pos) || !FarmPathfinder.isPassable(level, pos.above())) {
+        if (!FarmPathfinder.isFeetPassable(level, pos) || !FarmPathfinder.isPassable(level, pos.above())) {
             return false;
         }
         BlockPos floorPos = pos.below();
         BlockState floor = level.getBlockState(floorPos);
-        if (floor.isAir() || floor.is(Blocks.LAVA) || floor.is(Blocks.FIRE) || floor.is(Blocks.SWEET_BERRY_BUSH) || level.getBlockState(pos).is(Blocks.SWEET_BERRY_BUSH)) {
+        if (floor.isAir()
+            || FarmPathfinder.isHazard(floor)
+            || FarmPathfinder.isHazard(level.getBlockState(pos))
+            || FarmPathfinder.isHazard(level.getBlockState(pos.above()))) {
             return false;
         }
-        if (FarmPathfinder.isFenceOrWall(floor)) {
+        if (FarmPathfinder.isFenceOrWall(floor) || FarmPathfinder.isChestOrContainer(floor)) {
             return false;
         }
         return !floor.getCollisionShape(level, floorPos).isEmpty();
-    }
-
-    /**
-     * فحص وفتح أي أبواب خشبية أو بوابات سياج مغلقة
-     */
-    private void checkAndOpenDoors(Minecraft client, LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode) {
-        if (gameMode == null || doorInteractCooldown > 0) return;
-        BlockPos feet = player.blockPosition();
-
-        for (int ox = -1; ox <= 1; ox++) {
-            for (int oz = -1; oz <= 1; oz++) {
-                for (int oy = 0; oy <= 1; oy++) {
-                    BlockPos p = feet.offset(ox, oy, oz);
-                    BlockState st = level.getBlockState(p);
-                    boolean isDoor = FarmPathfinder.isOpenableDoor(st) && !st.getValue(DoorBlock.OPEN);
-                    boolean isGate = FarmPathfinder.isOpenableGate(st) && !st.getValue(FenceGateBlock.OPEN);
-
-                    if (isDoor || isGate) {
-                        BlockHitResult hit = new BlockHitResult(Vec3.atCenterOf(p), Direction.UP, p, false);
-                        gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
-                        doorInteractCooldown = 12;
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    private void lookAt(LocalPlayer player, double targetX, double targetY, double targetZ) {
-        double dx = targetX - player.getX();
-        double dy = targetY - player.getEyeY();
-        double dz = targetZ - player.getZ();
-
-        double distXZ = Math.sqrt(dx * dx + dz * dz);
-        float targetYaw = (float) (Math.atan2(dz, dx) * 180.0 / Math.PI) - 90.0F;
-        float targetPitch = (float) (-(Math.atan2(dy, distXZ) * 180.0 / Math.PI));
-
-        player.setYRot(targetYaw);
-        player.setXRot(targetPitch);
-        player.yHeadRot = targetYaw;
-        player.yBodyRot = targetYaw;
     }
 
     private void smoothLookTowards(LocalPlayer player, float targetYaw, float targetPitch, float maxStep) {
@@ -779,16 +558,7 @@ public class BotFollowController {
     }
 
     private void releaseMovement(Minecraft client) {
-        if (client == null || client.options == null) return;
-        client.options.keyUp.setDown(false);
-        client.options.keyDown.setDown(false);
-        client.options.keyLeft.setDown(false);
-        client.options.keyRight.setDown(false);
-        client.options.keyJump.setDown(false);
-        client.options.keySprint.setDown(false);
-        if (client.player != null) {
-            client.player.setSprinting(false);
-        }
+        BotEquipmentHelper.releaseMovementKeys(client);
     }
 
     private Player findTargetPlayer(ClientLevel level) {
@@ -815,10 +585,6 @@ public class BotFollowController {
         return null;
     }
 
-    private boolean ensureBestAxeInMainHand(LocalPlayer player, MultiPlayerGameMode gameMode) {
-        return BotEquipmentHelper.ensureBestInMainHand(player, gameMode, BotEquipmentHelper::getAxeTier, 1, 0);
-    }
-
     private void ensureShieldInOffhand(LocalPlayer player, MultiPlayerGameMode gameMode) {
         BotEquipmentHelper.ensureInOffhand(player, gameMode, stack -> stack.is(Items.SHIELD));
     }
@@ -838,112 +604,62 @@ public class BotFollowController {
 
     private boolean ensureFoodInHand(LocalPlayer player, MultiPlayerGameMode gameMode) {
         BotFoodManager foodMgr = BotFoodManager.getInstance();
-
-        // 1. فحص اليد الرئيسية: هل تحتوي بالفعل على طعام مسموح وصالح للأكل الآن؟
         if (foodMgr.canEatNow(player, player.getMainHandItem())) {
             return true;
         }
 
-        int bestSlot = -1;
-        int bestScore = -1;
-        // 2. البحث في شريط الأدوات (Hotbar 0-8)
-        for (int i = 0; i < 9; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (foodMgr.canEatNow(player, stack)) {
-                int score = foodMgr.getFoodScore(stack);
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestSlot = i;
-                }
-            }
-        }
-
-        if (bestSlot != -1) {
-            player.getInventory().setSelectedSlot(bestSlot);
-            if (player.connection != null) {
-                player.connection.send(new ServerboundSetCarriedItemPacket(bestSlot));
-            }
+        int avoidSlot = (preEatWeaponSlot >= 0 && preEatWeaponSlot < 9) ? preEatWeaponSlot : 0;
+        int fallbackSlot = (avoidSlot == 8) ? 7 : 8;
+        int foodSlot = foodMgr.ensureBestFoodInHotbar(player, gameMode, fallbackSlot, avoidSlot);
+        if (foodSlot != -1) {
+            BotEquipmentHelper.selectHotbarSlot(player, foodSlot);
             return true;
         }
-
-        // 3. البحث في الحقيبة الرئيسية (9-35) ونقله للـ Hotbar
-        int invSlot = -1;
-        bestScore = -1;
-        for (int i = 9; i < 36; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (foodMgr.canEatNow(player, stack)) {
-                int score = foodMgr.getFoodScore(stack);
-                if (score > bestScore) {
-                    bestScore = score;
-                    invSlot = i;
-                }
-            }
-        }
-
-        if (invSlot != -1) {
-            int targetHotbar = 0;
-            int containerId = player.inventoryMenu.containerId;
-            gameMode.handleContainerInput(containerId, invSlot, targetHotbar, ContainerInput.SWAP, player);
-            player.getInventory().setSelectedSlot(targetHotbar);
-            if (player.connection != null) {
-                player.connection.send(new ServerboundSetCarriedItemPacket(targetHotbar));
-            }
-            return true;
-        }
-
         return false;
     }
 
     /**
-     * الأولوية رقم 1 للبوت: الأكل والعلاج الذاتي التلقائي أثناء الاتباع:
-     * - الأصل الأساسي هو شريط الطعام (الجوع) وليس الصحة.
-     * - إذا كان شريط الجوع ممتلئاً (20): لا يحاول أكل الطعام العادي نهائياً،
-     *   ولا يأكل إلا إذا كان يملك تفاحاً ذهبياً مسموحاً وكانت الصحة ناقصة.
-     * - إن كان جائعاً ولم يجد أي طعام مسموح به، لا يأكل ويرسل في الشات "أنا جائع" كل دقيقة.
+     * الأولوية رقم 1 للبوت: الأكل والعلاج الذاتي التلقائي أثناء الاتباع
      */
     private boolean handleFollowEating(Minecraft client, LocalPlayer player, MultiPlayerGameMode gameMode) {
         int food = player.getFoodData().getFoodLevel();
         float health = player.getHealth();
-        boolean needsFood = player.getFoodData().needsFood(); // food < 20
-        boolean isFullFood = !needsFood; // food >= 20
+        boolean needsFood = player.getFoodData().needsFood();
+        boolean isFullFood = !needsFood;
 
-        // فحص هل البوت يحتاج لتناول طعام أصلاً:
         if (isFullFood) {
             if (health >= 20.0f) {
                 stopFollowEating(client, player, gameMode);
                 return false;
             }
-            // الصحة ناقصة وشريط الجوع ممتلئ تماماً:
-            // هل يملك تفاحاً ذهبياً مسموحاً به في الحقيبة؟
-            boolean hasGoldenApple = hasAllowedGoldenApple(player);
-            if (!hasGoldenApple) {
-                // شبعان تماماً ولا يملك تفاحاً ذهبياً: لا يحاول الأكل، بل يعتمد على التجدد الطبيعي السريع
+            if (!hasAllowedGoldenApple(player)) {
                 stopFollowEating(client, player, gameMode);
                 return false;
             }
         }
 
-        // محاولة سحب أفضل طعام مسموح لليد الرئيسية
+        if (!isEatingWhileFollowing && preEatWeaponSlot == -1) {
+            preEatWeaponSlot = player.getInventory().getSelectedSlot();
+        }
+
+        // محاولة سحب أفضل طعام مسموح لليد الرئيسية مع حفظ خانة السلاح السابقة
         boolean hasFood = ensureFoodInHand(player, gameMode);
         if (!hasFood) {
+            preEatWeaponSlot = -1;
             stopFollowEating(client, player, gameMode);
 
-            // إن كان جائعاً ولم يجد أي طعام مسموح به: لا يأكل ويرسل "أنا جائع" كل دقيقة
-            if (needsFood) {
-                if (hungryAlertCooldown <= 0) {
-                    hungryAlertCooldown = 1200; // دقيقة واحدة = 1200 نبضة
-                    if (player.connection != null) {
-                        player.connection.sendChat("أنا جائع!");
-                    }
-                    if (client.player != null) {
-                        client.player.sendSystemMessage(Component.literal("§c[Bot] أنا جائع ولا أملك أي طعام مسموح به في الحقيبة!"));
-                    }
+            if (needsFood && hungryAlertCooldown <= 0) {
+                hungryAlertCooldown = 1200;
+                if (player.connection != null) {
+                    player.connection.sendChat("أنا جائع!");
+                }
+                if (client.player != null) {
+                    client.player.sendSystemMessage(Component.literal("§c[Bot] أنا جائع ولا أملك أي طعام مسموح به في الحقيبة!"));
                 }
             }
             return false;
         }
 
-        // تحسين نمط الاستهلاك: تصفير عداد الحبة عند ابتلاعها وارتفاع الجوع
         if (isEatingWhileFollowing && lastFollowFoodLevel != -1 && food > lastFollowFoodLevel) {
             followEatingTicks = 0;
         }
@@ -952,7 +668,6 @@ public class BotFollowController {
         isEatingWhileFollowing = true;
         followEatingTicks++;
 
-        // تحرير الدرع إذا كان يستخدمه للبدء في الأكل
         if (player.isUsingItem() && player.getUseItem().is(Items.SHIELD)) {
             gameMode.releaseUsingItem(player);
             player.stopUsingItem();
@@ -966,7 +681,6 @@ public class BotFollowController {
             client.options.keyUse.setDown(true);
         }
 
-        // مهلة أمان للحبة الواحدة
         if (followEatingTicks > 45) {
             followEatingTicks = 0;
             if (!player.getFoodData().needsFood() && player.getHealth() >= 20.0f) {
@@ -979,7 +693,10 @@ public class BotFollowController {
     }
 
     private void stopFollowEating(Minecraft client, LocalPlayer player, MultiPlayerGameMode gameMode) {
-        if (!isEatingWhileFollowing) return;
+        if (!isEatingWhileFollowing) {
+            preEatWeaponSlot = -1;
+            return;
+        }
         isEatingWhileFollowing = false;
         followEatingTicks = 0;
         lastFollowFoodLevel = -1;
@@ -996,9 +713,20 @@ public class BotFollowController {
             client.options.keyUse.setDown(false);
         }
 
-        // إعادة تجهيز الفأس باليد الرئيسية والدرع باليد اليسرى فور الانتهاء من الأكل
+        // إعادة تجهيز السلاح السابق (سيف أو فأس) والدرع باليد اليسرى فور الانتهاء من الأكل
         if (player != null && gameMode != null) {
-            ensureBestAxeInMainHand(player, gameMode);
+            boolean restored = false;
+            if (preEatWeaponSlot >= 0 && preEatWeaponSlot < 9) {
+                ItemStack prevStack = player.getInventory().getItem(preEatWeaponSlot);
+                if (BotEquipmentHelper.getAxeOrSwordTier(prevStack) > 0) {
+                    BotEquipmentHelper.selectHotbarSlot(player, preEatWeaponSlot);
+                    restored = true;
+                }
+            }
+            if (!restored) {
+                BotEquipmentHelper.ensureBestInMainHand(player, gameMode, BotEquipmentHelper::getAxeOrSwordTier, 1, 0);
+            }
+            preEatWeaponSlot = -1;
             ensureShieldInOffhand(player, gameMode);
         }
     }
@@ -1060,5 +788,293 @@ public class BotFollowController {
         }
 
         return bestDir;
+    }
+
+    // =========================================================================
+    // منطق النوم بجانب القائد عند نومه وتوفر سرير قريب غير مشغول
+    // =========================================================================
+
+    private void resetSleepState() {
+        targetSleepBedPos = null;
+        sleepScanCooldown = 0;
+        sleepInteractCooldown = 0;
+        sleepAttemptCount = 0;
+        failedBedCooldowns.clear();
+        sleepingWithCompanion = false;
+        preSleepSlot = -1;
+        sleepReenterCooldown = 0;
+        sleepMessageSent = false;
+    }
+
+    private boolean handleSleepWithCompanion(
+            Minecraft client,
+            LocalPlayer player,
+            ClientLevel level,
+            MultiPlayerGameMode gameMode,
+            Player companion) {
+        if (player.isSleeping()) {
+            sleepingWithCompanion = true;
+            targetSleepBedPos = null;
+            sleepAttemptCount = 0;
+            navigator.clearPathOnly();
+            releaseMovement(client);
+            return true;
+        }
+
+        if (targetSleepBedPos != null) {
+            if (!isBedBlock(level, targetSleepBedPos)
+                || failedBedCooldowns.containsKey(targetSleepBedPos)
+                || isBedOccupiedOrCompanionBed(level, targetSleepBedPos, companion)
+                || !isBedNearCompanion(targetSleepBedPos, companion, 14.0)) {
+                targetSleepBedPos = null;
+                sleepAttemptCount = 0;
+                navigator.clearPathOnly();
+            }
+        }
+
+        if (targetSleepBedPos == null) {
+            if (sleepScanCooldown <= 0) {
+                targetSleepBedPos = findAvailableBedNearCompanion(level, player, companion, 10);
+                sleepScanCooldown = 12;
+                sleepAttemptCount = 0;
+                if (targetSleepBedPos != null && !sleepMessageSent && client.player != null) {
+                    client.player.sendSystemMessage(Component.literal("§a[Bot] القائد نائم؛ يتوجه البوت للنوم في السرير المجاور..."));
+                    sleepMessageSent = true;
+                }
+            }
+            if (targetSleepBedPos == null) {
+                return false;
+            }
+        }
+
+        // إيقاف أي تناول طعام قبل التوجه والتفاعل مع السرير
+        stopFollowEating(client, player, gameMode);
+
+        double bx = targetSleepBedPos.getX() + 0.5;
+        double by = targetSleepBedPos.getY() + 0.45;
+        double bz = targetSleepBedPos.getZ() + 0.5;
+        double distSq = player.distanceToSqr(bx, by, bz);
+        double dyBed = Math.abs(targetSleepBedPos.getY() - player.getY());
+        boolean hasClearView = hasClearInteractionLineToBed(level, player, targetSleepBedPos, bx, by, bz);
+
+        if (distSq > 2.65 * 2.65 || dyBed > 2.2 || !hasClearView) {
+            double navStopDist = hasClearView ? 2.1 : 1.0;
+            BotNavigator.NavResult navRes = navigator.navigateTo(
+                client,
+                player,
+                level,
+                gameMode,
+                new Vec3(bx, targetSleepBedPos.getY(), bz),
+                true,
+                navStopDist,
+                false,
+                45.0f,
+                true,
+                3500
+            );
+            if (navRes == BotNavigator.NavResult.BLOCKED_UNREACHABLE
+                || (navRes == BotNavigator.NavResult.ARRIVED && !hasClearView)) {
+                markBedFailed(targetSleepBedPos);
+                navigator.reset(client);
+                return false;
+            }
+            return true;
+        }
+
+        // وصل البوت للسرير وبخط رؤية مفتوح: التوقف، إيقاف الدرع أو السنيك، والنوم في السرير
+        navigator.clearPathOnly();
+        releaseMovement(client);
+        if (client.options != null) {
+            client.options.keyUse.setDown(false);
+        }
+        if (gameMode != null && player.isUsingItem()) {
+            gameMode.releaseUsingItem(player);
+            player.stopUsingItem();
+        }
+
+        BotEquipmentHelper.smoothLookAt(player, bx, by, bz, 50.0f);
+
+        if (sleepInteractCooldown <= 0 && gameMode != null) {
+            ItemStack mainHand = player.getMainHandItem();
+            boolean heldSafe = mainHand.isEmpty() || BotEquipmentHelper.getSwordTier(mainHand) > 0;
+            if (!heldSafe) {
+                int safeSlot = BotEquipmentHelper.findSafeInteractionSlot(player);
+                if (safeSlot != -1 && safeSlot != player.getInventory().getSelectedSlot()) {
+                    if (preSleepSlot == -1) {
+                        preSleepSlot = player.getInventory().getSelectedSlot();
+                    }
+                    BotEquipmentHelper.selectHotbarSlot(player, safeSlot);
+                }
+            }
+
+            BlockHitResult hit = new BlockHitResult(
+                new Vec3(bx, by, bz),
+                Direction.UP,
+                targetSleepBedPos,
+                false
+            );
+            gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
+            player.swing(InteractionHand.MAIN_HAND);
+            sleepInteractCooldown = 14;
+            sleepAttemptCount++;
+
+            if (sleepAttemptCount >= 4) {
+                markBedFailed(targetSleepBedPos);
+                restorePostSleepWeapon(player, gameMode);
+                navigator.clearPathOnly();
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private void markBedFailed(BlockPos bedPos) {
+        if (bedPos != null) {
+            failedBedCooldowns.put(bedPos.immutable(), 100);
+        }
+        targetSleepBedPos = null;
+        sleepAttemptCount = 0;
+        sleepScanCooldown = 0;
+    }
+
+    private void restorePostSleepWeapon(LocalPlayer player, MultiPlayerGameMode gameMode) {
+        if (player == null) {
+            preSleepSlot = -1;
+            return;
+        }
+        if (preSleepSlot >= 0 && preSleepSlot < 9 && preSleepSlot != player.getInventory().getSelectedSlot()) {
+            ItemStack prevStack = player.getInventory().getItem(preSleepSlot);
+            if (!prevStack.isEmpty()) {
+                BotEquipmentHelper.selectHotbarSlot(player, preSleepSlot);
+            }
+        }
+        preSleepSlot = -1;
+        if (gameMode != null) {
+            ensureShieldInOffhand(player, gameMode);
+        }
+    }
+
+    private static boolean isBedBlock(ClientLevel level, BlockPos pos) {
+        if (level == null || pos == null) return false;
+        BlockState state = level.getBlockState(pos);
+        return state.getBlock() instanceof BedBlock || state.is(BlockTags.BEDS);
+    }
+
+    private static boolean isBedNearCompanion(BlockPos bedPos, Player companion, double maxRadius) {
+        if (bedPos == null || companion == null) return false;
+        BlockPos origin = companion.getSleepingPos().orElse(companion.blockPosition());
+        double dx = (bedPos.getX() + 0.5) - (origin.getX() + 0.5);
+        double dy = (bedPos.getY() + 0.5) - (origin.getY() + 0.5);
+        double dz = (bedPos.getZ() + 0.5) - (origin.getZ() + 0.5);
+        return (dx * dx + dz * dz) <= maxRadius * maxRadius && Math.abs(dy) <= 5.0;
+    }
+
+    private static boolean isBedOccupiedOrCompanionBed(ClientLevel level, BlockPos pos, Player companion) {
+        BlockState state = level.getBlockState(pos);
+        if (state.getOptionalValue(BedBlock.OCCUPIED).orElse(false)) {
+            return true;
+        }
+        if (companion != null) {
+            BlockPos leaderBedPos = companion.getSleepingPos().orElse(null);
+            if (leaderBedPos != null) {
+                if (pos.equals(leaderBedPos)) {
+                    return true;
+                }
+                BlockState leaderState = level.getBlockState(leaderBedPos);
+                Direction leaderFacing = leaderState.getOptionalValue(BedBlock.FACING).orElse(null);
+                if (leaderFacing != null && pos.equals(leaderBedPos.relative(leaderFacing.getOpposite()))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private BlockPos findAvailableBedNearCompanion(ClientLevel level, LocalPlayer player, Player companion, int radius) {
+        BlockPos origin = companion.getSleepingPos().orElse(companion.blockPosition());
+        BlockPos best = null;
+        double bestScore = Double.MAX_VALUE;
+
+        for (int dy = -3; dy <= 4; dy++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    BlockPos pos = origin.offset(dx, dy, dz);
+                    if (failedBedCooldowns.containsKey(pos)) {
+                        continue;
+                    }
+                    if (!isBedBlock(level, pos) || isBedOccupiedOrCompanionBed(level, pos, companion)) {
+                        continue;
+                    }
+                    BlockState aboveState = level.getBlockState(pos.above());
+                    if (FarmPathfinder.isHazard(aboveState)
+                        || (!FarmPathfinder.isPassable(level, pos.above()) && !isBedBlock(level, pos.above()))) {
+                        continue;
+                    }
+
+                    double botDistSq = player.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
+                    double compDistSq = origin.distSqr(pos);
+                    double score = botDistSq + compDistSq * 0.25;
+                    if (score < bestScore) {
+                        bestScore = score;
+                        best = pos.immutable();
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    private static boolean hasClearInteractionLineToBed(
+            ClientLevel level,
+            LocalPlayer player,
+            BlockPos bedPos,
+            double bx,
+            double by,
+            double bz) {
+        Vec3 eye = player.getEyePosition();
+        Vec3 target = new Vec3(bx, by, bz);
+        Vec3 delta = target.subtract(eye);
+        double dist = delta.length();
+        if (dist < 0.2) return true;
+
+        Direction bedFacing = level.getBlockState(bedPos).getOptionalValue(BedBlock.FACING).orElse(null);
+        BlockPos adj1 = bedFacing != null ? bedPos.relative(bedFacing) : null;
+        BlockPos adj2 = bedFacing != null ? bedPos.relative(bedFacing.getOpposite()) : null;
+
+        int steps = Math.max(4, (int) Math.ceil(dist / 0.25));
+        for (int i = 1; i < steps; i++) {
+            double f = (double) i / steps;
+            Vec3 sample = eye.add(delta.scale(f));
+            BlockPos p = BlockPos.containing(sample.x, sample.y, sample.z);
+            if (p.equals(bedPos)) {
+                continue;
+            }
+            if ((p.equals(adj1) || p.equals(adj2)) && isBedBlock(level, p)) {
+                continue;
+            }
+
+            BlockState state = level.getBlockState(p);
+            if (state.isAir()) {
+                continue;
+            }
+            if (FarmPathfinder.isOpenableDoor(state) && !state.getValue(DoorBlock.OPEN)) {
+                return false;
+            }
+            if (FarmPathfinder.isOpenableGate(state) && !state.getValue(FenceGateBlock.OPEN)) {
+                return false;
+            }
+            if (FarmPathfinder.isPassable(level, p)) {
+                continue;
+            }
+            VoxelShape shape = state.getCollisionShape(level, p);
+            if (!shape.isEmpty()) {
+                double localY = sample.y - p.getY();
+                if (localY <= shape.max(Direction.Axis.Y) + 0.05) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 }

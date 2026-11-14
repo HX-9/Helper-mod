@@ -1,13 +1,19 @@
 package com.helpermod.bot;
 
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.tags.ItemTags;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.item.AxeItem;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
 
 import java.util.function.Predicate;
 import java.util.function.ToIntFunction;
@@ -221,5 +227,115 @@ public final class BotEquipmentHelper {
         }
 
         return false;
+    }
+
+    /**
+     * التحقق من جاهزية الدرع في اليد اليسرى وعدم وجوده في فترة التبريد (Cooldown).
+     */
+    public static boolean isShieldReady(LocalPlayer player) {
+        if (player == null) return false;
+        ItemStack offhand = player.getOffhandItem();
+        return !offhand.isEmpty() && offhand.is(Items.SHIELD) && !player.getCooldowns().isOnCooldown(offhand);
+    }
+
+    /**
+     * التحقق مما إذا كان الدرع في اليد اليسرى على وشك الكسر (<= 15 نقطة متانة).
+     */
+    public static boolean isOffhandShieldLowDurability(LocalPlayer player) {
+        if (player == null) return false;
+        ItemStack offhand = player.getOffhandItem();
+        return !offhand.isEmpty()
+            && offhand.is(Items.SHIELD)
+            && offhand.isDamageableItem()
+            && (offhand.getMaxDamage() - offhand.getDamageValue()) <= 15;
+    }
+
+    /**
+     * تحرير مفاتيح الحركة وإيقاف الركض بأمان.
+     */
+    public static void releaseMovementKeys(Minecraft client) {
+        if (client == null || client.options == null) return;
+        client.options.keyUp.setDown(false);
+        client.options.keyDown.setDown(false);
+        client.options.keyLeft.setDown(false);
+        client.options.keyRight.setDown(false);
+        client.options.keyJump.setDown(false);
+        client.options.keySprint.setDown(false);
+        client.options.keyShift.setDown(false);
+        if (client.player != null) {
+            client.player.setSprinting(false);
+        }
+    }
+
+    /**
+     * توجيه النظر تدريجياً وسلساً نحو نقطة محددة بحد أقصى للالتفاف في كل تكة.
+     */
+    public static void smoothLookAt(LocalPlayer player, double targetX, double targetY, double targetZ, float maxTurnDegrees) {
+        if (player == null) return;
+        double dx = targetX - player.getX();
+        double dy = targetY - player.getEyeY();
+        double dz = targetZ - player.getZ();
+        double distXZ = Math.sqrt(dx * dx + dz * dz);
+
+        float targetYaw = (float) (Math.atan2(dz, dx) * 180.0 / Math.PI) - 90.0f;
+        float targetPitch = (float) -(Math.atan2(dy, distXZ) * 180.0 / Math.PI);
+
+        float currentYaw = player.getYRot();
+        float currentPitch = player.getXRot();
+
+        float yawDiff = wrapDegrees(targetYaw - currentYaw);
+        float pitchDiff = wrapDegrees(targetPitch - currentPitch);
+
+        float clampedYaw = Math.max(-maxTurnDegrees, Math.min(maxTurnDegrees, yawDiff));
+        float clampedPitch = Math.max(-maxTurnDegrees, Math.min(maxTurnDegrees, pitchDiff));
+
+        player.setYRot(currentYaw + clampedYaw);
+        player.setXRot(currentPitch + clampedPitch);
+        player.yHeadRot = player.getYRot();
+        player.yBodyRot = player.getYRot();
+    }
+
+    /**
+     * حساب المسافة الفعلية من موضع عيني البوت إلى أقرب نقطة على صندوق تصادم الهدف (AABB).
+     */
+    public static double getEyeToHitboxDistanceSq(LocalPlayer player, Entity target) {
+        if (player == null || target == null) return Double.MAX_VALUE;
+        Vec3 eye = player.getEyePosition();
+        AABB box = target.getBoundingBox();
+        double cx = Math.max(box.minX, Math.min(eye.x, box.maxX));
+        double cy = Math.max(box.minY, Math.min(eye.y, box.maxY));
+        double cz = Math.max(box.minZ, Math.min(eye.z, box.maxZ));
+        return eye.distanceToSqr(cx, cy, cz);
+    }
+
+    public static double getEyeToHitboxDistance(LocalPlayer player, Entity target) {
+        double sq = getEyeToHitboxDistanceSq(player, target);
+        return sq == Double.MAX_VALUE ? Double.MAX_VALUE : Math.sqrt(sq);
+    }
+
+    /**
+     * اختيار خانة آمنة في شريط الأدوات للتفاعل مع الكتل (مثل الأسرّة والأبواب):
+     * يفضّل اليد الفارغة، ثم السيف، ثم أي عنصر ليس كتلة بناء أو فأساً.
+     */
+    public static int findSafeInteractionSlot(LocalPlayer player) {
+        if (player == null) return -1;
+        Inventory inv = player.getInventory();
+        for (int i = 0; i < 9; i++) {
+            if (inv.getItem(i).isEmpty()) {
+                return i;
+            }
+        }
+        for (int i = 0; i < 9; i++) {
+            if (getSwordTier(inv.getItem(i)) > 0) {
+                return i;
+            }
+        }
+        for (int i = 0; i < 9; i++) {
+            var item = inv.getItem(i).getItem();
+            if (!(item instanceof BlockItem) && !(item instanceof AxeItem)) {
+                return i;
+            }
+        }
+        return -1;
     }
 }

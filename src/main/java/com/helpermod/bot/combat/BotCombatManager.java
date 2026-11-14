@@ -3,20 +3,20 @@ package com.helpermod.bot.combat;
 import com.helpermod.bot.BotEquipmentHelper;
 import com.helpermod.bot.BotFollowController;
 import com.helpermod.bot.friend.BotFriendManager;
+import com.helpermod.bot.path.BotNavigator;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.client.player.LocalPlayer;
-import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.TamableAnimal;
 import net.minecraft.world.entity.monster.Creeper;
 import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.entity.projectile.Projectile;
-import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.phys.AABB;
@@ -31,7 +31,6 @@ import java.util.*;
  * - يفضل السيف عند وجود أكثر من عدوين في نفس الجهة لضربة Sweeping شاملة وبدون قفز إطلاقاً
  * - نظام تثبيت الهدف (Target Lock) لمنع التوهان بين الأعداء الكثر
  */
-@SuppressWarnings("unused")
 public class BotCombatManager {
     private static final BotCombatManager INSTANCE = new BotCombatManager();
 
@@ -46,6 +45,9 @@ public class BotCombatManager {
 
     // سجل الأعداء المستهدفين مع مؤقت صلاحية النبضات
     private final Map<UUID, Integer> hostileTargets = new HashMap<>();
+    // مؤقت حظر مؤقت للأهداف التي يتعذر الوصول إليها عبر A* (خلف جدار أو هاوية)
+    private final Map<UUID, Integer> unreachableTargets = new HashMap<>();
+    private final BotNavigator combatNavigator = new BotNavigator();
 
     // نظام تثبيت الهدف لمنع التوهان بين الأعداء (Target Focus & Lock-in)
     private UUID lockedTargetUUID = null;
@@ -101,6 +103,22 @@ public class BotCombatManager {
         if (arrowDefenseCooldown > 0) arrowDefenseCooldown--;
         if (targetLockTicks > 0) targetLockTicks--;
         if (weaponChoiceLockTicks > 0) weaponChoiceLockTicks--;
+        combatNavigator.tickCooldowns();
+
+        unreachableTargets.entrySet().removeIf(entry -> {
+            int rem = entry.getValue() - 1;
+            if (rem <= 0) return true;
+            entry.setValue(rem);
+            return false;
+        });
+
+        // حراسة التنفس الطارئة في الماء (الطفو أو الهروب من السقف قبل الغرق مع السماح بالغوص الحر)
+        if (combatNavigator.handleUrgentWaterBreathing(client, player, level, gameMode)) {
+            releaseShield(client, player, gameMode);
+            isJumpingForAxeCrit = false;
+            axeCritTicks = 0;
+            return true;
+        }
 
         // تحديث سجل الأعداء والتهديدات المحيطة
         updateHostilityRegistry(client, player, level, companion);
@@ -109,66 +127,54 @@ public class BotCombatManager {
         LivingEntity target = getActiveHostileTarget(level, player, companion, distToCompanion);
 
         if (target == null) {
-            // لا يوجد أعداء نشطون: خفض الدرع وتصفير تكتيك الكريبر
-            if (client.options.keyUse.isDown()) {
-                client.options.keyUse.setDown(false);
-            }
-            if (player.isUsingItem() && player.getUseItem().is(Items.SHIELD)) {
-                gameMode.releaseUsingItem(player);
-                player.stopUsingItem();
-            }
+            releaseShield(client, player, gameMode);
             if (creeperState != CreeperCombatState.NONE) {
                 creeperState = CreeperCombatState.NONE;
                 creeperFleeStartPos = null;
                 creeperFleeDir = null;
             }
+            combatNavigator.clearPathOnly();
             isJumpingForAxeCrit = false;
             axeCritTicks = 0;
             return false;
         }
 
         double distToEnemy = player.distanceTo(target);
+        double eyeDistToEnemy = BotEquipmentHelper.getEyeToHitboxDistance(player, target);
 
         // مصفوفة القرار للاشتباك:
-        // إذا ابتعد القائد مسافة كبيرة (> 14.0 بلوكة)، فإن اللحاق به له الأولوية القصوى ولا نشتبك إلا إذا كان العدو ملاصقاً تماماً للبوت!
         boolean hasSight = player.hasLineOfSight(target);
         boolean shouldEngage;
         if (distToCompanion > 14.0) {
-            // القائد مبتعد جداً: نشتبك فقط إذا كان العدو مكشوفاً وملاصقاً للبوت جداً (<= 3.2 بلوكة) للدفاع عن النفس
-            shouldEngage = hasSight && distToEnemy <= 3.2;
+            // القائد مبتعد جداً: نشتبك فقط إذا كان العدو مكشوفاً وفي مدى الضرب الفعلي للدفاع عن النفس
+            shouldEngage = hasSight && eyeDistToEnemy <= 2.95 && distToEnemy <= 3.6;
         } else {
-            // القائد ضمن نطاق الحراسة الطبيعي (<= 14.0 بلوكة): البوت يحمي القائد والمنطقة طالما أن العدو مكشوف
-            shouldEngage = hasSight && (distToEnemy <= 10.0 || (companion != null && companion.distanceTo(target) <= 10.0));
+            // القائد ضمن نطاق الحراسة: يشمل الأعداء المكشوفين حتى 16 بلوكة إن كانوا مسجلين كمهاجمين
+            boolean registeredEnemy = hostileTargets.containsKey(target.getUUID());
+            shouldEngage = hasSight && (distToEnemy <= 12.0 || (registeredEnemy && distToEnemy <= 16.0) || (companion != null && companion.distanceTo(target) <= 10.0));
         }
 
         if (!shouldEngage) {
-            // العدو بعيد أو محجوب أو القائد يبتعد: الانسحاب الفوري للحاق بالقائد
             lockedTargetUUID = null;
-            // خفض الدرع فوراً لتمكين الركض السريع (Sprint) واللحاق بالقائد دون بطء
-            if (client.options.keyUse.isDown()) {
-                client.options.keyUse.setDown(false);
-            }
-            if (player.isUsingItem()) {
-                gameMode.releaseUsingItem(player);
-                player.stopUsingItem();
-            }
-            return false; // نترك لـ BotFollowController قيادة الركض السريع نحو القائد
+            combatNavigator.clearPathOnly();
+            releaseShield(client, player, gameMode);
+            return false;
         }
 
         // تنفيذ المعركة التكتيكية المستقلة
-        return executeTacticalCombat(client, player, level, gameMode, companion, target, distToEnemy);
+        return executeTacticalCombat(client, player, level, gameMode, companion, target, distToEnemy, eyeDistToEnemy);
     }
 
     /**
      * تنفيذ القتال التكتيكي بالكامل
      */
-    private boolean executeTacticalCombat(Minecraft client, LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode, Player companion, LivingEntity enemy, double distToEnemy) {
+    private boolean executeTacticalCombat(Minecraft client, LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode, Player companion, LivingEntity enemy, double distToEnemy, double eyeDistToEnemy) {
         // 1. فحص الكريبر كحالة تكتيكية استثنائية (ضربة ثم هروب 10 بلوكات)
         boolean isCreeper = enemy instanceof Creeper
             || (enemy instanceof Mob mob && mob.getType().getDescriptionId().contains("creeper"));
 
         if (isCreeper && enemy instanceof Creeper creeper) {
-            return executeCreeperTactics(client, player, level, gameMode, creeper, distToEnemy);
+            return executeCreeperTactics(client, player, level, gameMode, creeper, distToEnemy, eyeDistToEnemy);
         } else {
             if (creeperState != CreeperCombatState.NONE) {
                 creeperState = CreeperCombatState.NONE;
@@ -177,10 +183,8 @@ public class BotCombatManager {
             }
         }
 
-        // 2. تحديد نوع السلاح التكتيكي الأنسب:
-        // - أكثر من عدوين في نفس الجهة -> السيف (Sword) لضربة Sweeping Edge شاملة وبدون قفز!
-        // - أعداء قليلة ومتفرقة -> الفأس (Axe) لضربة Crit بالقفز المنضبط
-        WeaponMode weaponMode = determineWeaponChoice(player, level, enemy);
+        // 2. تحديد نوع السلاح التكتيكي مع مراعاة حماية القائد والحلفاء من ضربة Sweeping Edge
+        WeaponMode weaponMode = determineWeaponChoice(player, level, companion, enemy);
 
         if (weaponMode == WeaponMode.SWORD) {
             ensureBestSwordInMainHand(player, gameMode);
@@ -189,53 +193,45 @@ public class BotCombatManager {
         }
 
         ensureShieldInOffhand(player, gameMode);
+        checkShieldDisabledAndSwap(client, player, gameMode);
 
-        // 3. توجيه النظر بسلاسة ودقة نحو العدو
-        smoothLookAt(player, enemy.getX(), enemy.getEyeY() - 0.15, enemy.getZ(), 85.0f);
+        // 3. فحص مدى الهجوم الحقيقي من العين لصندوق تصادم العدو
+        boolean inMeleeReach = eyeDistToEnemy <= 2.95 && distToEnemy <= 3.6;
 
-        // 4. فحص اكتمال شحن السلاح
-        float charge = player.getAttackStrengthScale(0.0f);
-        boolean isFullyCharged = (weaponMode == WeaponMode.SWORD) ? (charge >= 0.85f) : (charge >= 0.90f);
+        if (inMeleeReach) {
+            smoothLookAt(player, enemy.getX(), enemy.getEyeY() - 0.15, enemy.getZ(), 50.0f);
+            float charge = player.getAttackStrengthScale(0.0f);
+            boolean isFullyCharged = (weaponMode == WeaponMode.SWORD) ? (charge >= 0.85f) : (charge >= 0.90f);
 
-        if (distToEnemy <= 3.2) {
-            // العدو في نطاق الضرب المباشر:
             client.options.keyDown.setDown(false);
+            combatNavigator.clearPathOnly();
 
             if (isFullyCharged) {
-                // خفض الدرع عند الهجوم
-                client.options.keyUse.setDown(false);
-                if (player.isUsingItem() && player.getUseItem().is(Items.SHIELD)) {
-                    gameMode.releaseUsingItem(player);
-                    player.stopUsingItem();
-                }
+                releaseShield(client, player, gameMode);
 
-                // ==========================================
-                // أ) القتال بالسيف (SWORD): ممنوع القفز نهائياً!
-                // ==========================================
+                // أ) القتال بالسيف (SWORD): بدون قفز
                 if (weaponMode == WeaponMode.SWORD) {
-                    client.options.keyJump.setDown(false);
+                    BotNavigator.releaseJumpOrMaintainWaterBuoyancy(client, player, level, enemy);
                     isJumpingForAxeCrit = false;
                     axeCritTicks = 0;
 
-                    smoothLookAt(player, enemy.getX(), enemy.getEyeY() - 0.15, enemy.getZ(), 100.0f);
+                    smoothLookAt(player, enemy.getX(), enemy.getEyeY() - 0.15, enemy.getZ(), 50.0f);
                     gameMode.attack(player, enemy);
                     player.swing(InteractionHand.MAIN_HAND);
 
                     checkEnemyDefeated(enemy);
-                    client.options.keyUp.setDown(distToEnemy > 1.8);
+                    client.options.keyUp.setDown(distToEnemy > 1.8 && !BotNavigator.isHazardOrDropAhead(level, player, enemy.getX() - player.getX(), enemy.getZ() - player.getZ()));
                 }
-                // ==========================================
-                // ب) القتال بالفأس (AXE): قفزة Crit محسوبة
-                // ==========================================
+                // ب) القتال بالفأس (AXE): قفزة Crit محسوبة عند السقوط
                 else {
-                    if (player.isInWater() || player.onClimbable()) {
-                        smoothLookAt(player, enemy.getX(), enemy.getEyeY() - 0.15, enemy.getZ(), 90.0f);
+                    if (BotNavigator.isEntityInWater(level, player) || player.onClimbable()) {
+                        smoothLookAt(player, enemy.getX(), enemy.getEyeY() - 0.15, enemy.getZ(), 50.0f);
                         gameMode.attack(player, enemy);
                         player.swing(InteractionHand.MAIN_HAND);
                         checkEnemyDefeated(enemy);
-                        client.options.keyJump.setDown(false);
+                        BotNavigator.releaseJumpOrMaintainWaterBuoyancy(client, player, level, enemy);
                         isJumpingForAxeCrit = false;
-                    } else if (player.onGround() && !isJumpingForAxeCrit && combatJumpCooldown <= 0 && BotFollowController.isCeilingClear(level, player.blockPosition())) {
+                    } else if (player.onGround() && !isJumpingForAxeCrit && combatJumpCooldown <= 0 && BotNavigator.isCeilingClear(level, player.blockPosition())) {
                         isJumpingForAxeCrit = true;
                         axeCritTicks = 0;
                         combatJumpCooldown = 12;
@@ -245,132 +241,121 @@ public class BotCombatManager {
                         client.options.keyJump.setDown(false);
                         axeCritTicks++;
                         boolean isFalling = player.getDeltaMovement().y < -0.01;
-                        boolean jumpTimeout = axeCritTicks > 6;
+                        boolean jumpTimeout = axeCritTicks > 7;
 
                         if (isFalling || jumpTimeout) {
-                            smoothLookAt(player, enemy.getX(), enemy.getEyeY() - 0.15, enemy.getZ(), 90.0f);
+                            smoothLookAt(player, enemy.getX(), enemy.getEyeY() - 0.15, enemy.getZ(), 50.0f);
                             gameMode.attack(player, enemy);
                             player.swing(InteractionHand.MAIN_HAND);
                             checkEnemyDefeated(enemy);
 
-                            client.options.keyJump.setDown(false);
-                            client.options.keyUp.setDown(distToEnemy > 1.6);
+                            BotNavigator.releaseJumpOrMaintainWaterBuoyancy(client, player, level, enemy);
+                            client.options.keyUp.setDown(false);
                             isJumpingForAxeCrit = false;
                             axeCritTicks = 0;
                         }
                     } else {
-                        // هجوم أرضي مباشر دون انتظار القفز لتسريع القضاء على الأعداء
-                        smoothLookAt(player, enemy.getX(), enemy.getEyeY() - 0.15, enemy.getZ(), 90.0f);
+                        smoothLookAt(player, enemy.getX(), enemy.getEyeY() - 0.15, enemy.getZ(), 50.0f);
                         gameMode.attack(player, enemy);
                         player.swing(InteractionHand.MAIN_HAND);
                         checkEnemyDefeated(enemy);
-                        client.options.keyJump.setDown(false);
-                        client.options.keyUp.setDown(distToEnemy > 1.6);
+                        BotNavigator.releaseJumpOrMaintainWaterBuoyancy(client, player, level, enemy);
+                        client.options.keyUp.setDown(false);
                     }
                 }
             } else {
-                // فترة شحن السلاح القصيرة (بين الضربات):
-                client.options.keyJump.setDown(false);
+                // فترة شحن السلاح القصيرة
+                BotNavigator.releaseJumpOrMaintainWaterBuoyancy(client, player, level, enemy);
                 isJumpingForAxeCrit = false;
                 axeCritTicks = 0;
 
-                smoothLookAt(player, enemy.getX(), enemy.getEyeY() - 0.15, enemy.getZ(), 100.0f);
+                smoothLookAt(player, enemy.getX(), enemy.getEyeY() - 0.15, enemy.getZ(), 50.0f);
 
-                // إذا كانت صحة البوت منخفضة جداً (< 8 قلوب)، يتراجع بالدرع
-                if (player.getHealth() < 8.0f) {
-                    checkShieldDisabledAndSwap(client, player, gameMode);
-                    client.options.keyUse.setDown(true);
-                    if (!player.isUsingItem() || !player.getUseItem().is(Items.SHIELD)) {
-                        gameMode.useItem(player, InteractionHand.OFF_HAND);
-                        player.startUsingItem(InteractionHand.OFF_HAND);
-                    }
+                boolean shouldGuard = BotEquipmentHelper.isShieldReady(player)
+                    && (player.getHealth() < 8.0f || distToEnemy <= 2.3 || arrowDefenseCooldown > 0);
+                if (shouldGuard) {
+                    raiseShield(client, player, gameMode);
+                    boolean lowHpBackpedal = player.getHealth() < 8.0f && !BotNavigator.isHazardOrDropAhead(level, player, player.getX() - enemy.getX(), player.getZ() - enemy.getZ());
                     client.options.keyUp.setDown(false);
-                    client.options.keyDown.setDown(true);
-                } else if (distToEnemy <= 2.2) {
-                    // العدو ملاصق ومستعد للضرب المضاد: رفع الدرع للصد اللحظي
-                    checkShieldDisabledAndSwap(client, player, gameMode);
-                    client.options.keyUse.setDown(true);
-                    if (!player.isUsingItem() || !player.getUseItem().is(Items.SHIELD)) {
-                        gameMode.useItem(player, InteractionHand.OFF_HAND);
-                        player.startUsingItem(InteractionHand.OFF_HAND);
-                    }
-                    client.options.keyUp.setDown(false);
-                    client.options.keyDown.setDown(false);
+                    client.options.keyDown.setDown(lowHpBackpedal);
                 } else {
-                    // العدو على بعد خطوة: خفض الدرع والاقتراب السريع للاستعداد للضربة القادمة
-                    if (client.options.keyUse.isDown()) client.options.keyUse.setDown(false);
-                    if (player.isUsingItem() && player.getUseItem().is(Items.SHIELD)) {
-                        gameMode.releaseUsingItem(player);
-                        player.stopUsingItem();
-                    }
+                    releaseShield(client, player, gameMode);
                     client.options.keyDown.setDown(false);
-                    client.options.keyUp.setDown(true);
+                    client.options.keyUp.setDown(distToEnemy > 2.2 && !BotNavigator.isHazardOrDropAhead(level, player, enemy.getX() - player.getX(), enemy.getZ() - player.getZ()));
                 }
             }
         } else {
-            // العدو أبعد من 3.2 بلوكات: الركض السريع (Sprint) نحوه فوراً
-            client.options.keyDown.setDown(false);
-            client.options.keyUp.setDown(true);
-            client.options.keySprint.setDown(true);
-            player.setSprinting(true);
-
-            // خفض الدرع أثناء الركض نحوه إلا إذا كان هناك سهم قادم
-            if (arrowDefenseCooldown <= 0) {
-                if (client.options.keyUse.isDown()) client.options.keyUse.setDown(false);
-                if (player.isUsingItem() && player.getUseItem().is(Items.SHIELD)) {
-                    gameMode.releaseUsingItem(player);
-                    player.stopUsingItem();
-                }
+            // العدو خارج مدى الضرب: التنقل الآمن عبر A* (BotNavigator) مع صد المقذوفات فقط إن كان الدرع جاهزاً
+            boolean blockingArrows = arrowDefenseCooldown > 0 && BotEquipmentHelper.isShieldReady(player);
+            if (blockingArrows) {
+                raiseShield(client, player, gameMode);
             } else {
-                checkShieldDisabledAndSwap(client, player, gameMode);
-                client.options.keyUse.setDown(true);
+                releaseShield(client, player, gameMode);
             }
 
-            // فحص القفز فقط عند وجود عائق أمامي حقيقي أو درجة صلبة
-            if (combatJumpCooldown <= 0 && player.onGround() && BotFollowController.isCeilingClear(level, player.blockPosition())) {
-                if (BotFollowController.isObstacleDirectlyAhead(player, level, enemy.getX(), enemy.getZ())
-                    || BotFollowController.hasStepDirectlyAhead(player, level, enemy.getX(), enemy.getZ())) {
-                    client.options.keyJump.setDown(true);
-                    combatJumpCooldown = 10;
-                } else {
-                    client.options.keyJump.setDown(false);
-                }
-            } else {
-                client.options.keyJump.setDown(false);
-            }
             isJumpingForAxeCrit = false;
             axeCritTicks = 0;
+
+            BotNavigator.NavResult navRes = combatNavigator.navigateTo(
+                client,
+                player,
+                level,
+                gameMode,
+                enemy.position(),
+                !blockingArrows,
+                2.3,
+                false,
+                45.0f,
+                true,
+                2500
+            );
+
+            if (navRes == BotNavigator.NavResult.BLOCKED_UNREACHABLE) {
+                // العدو خلف زجاج أو جدار أو وادٍ مقطوع: فك القفل مؤقتاً والعودة لمتابعة القائد
+                unreachableTargets.put(enemy.getUUID(), 40);
+                lockedTargetUUID = null;
+                targetLockTicks = 0;
+                combatNavigator.reset(client);
+                releaseShield(client, player, gameMode);
+                return false;
+            }
         }
 
         return true;
     }
 
     /**
-     * فحص وتحديد السلاح التكتيكي الأنسب مع تثبيت الاختيار لمنع تصفير شحن الهجوم:
-     * - إن كان هناك أكثر من عدوين في نفس الجهة (Crowd/Swarm): يفضل السيف.
-     * - إن كان الأعداء قليلة ومتفرقة: يفضل الفأس.
+     * فحص وتحديد السلاح التكتيكي الأنسب مع حماية القائد والحلفاء من ضربة السيف الواسعة.
      */
     public WeaponMode determineWeaponChoice(LocalPlayer player, ClientLevel level, LivingEntity primaryTarget) {
+        return determineWeaponChoice(player, level, null, primaryTarget);
+    }
+
+    public WeaponMode determineWeaponChoice(LocalPlayer player, ClientLevel level, Player companion, LivingEntity primaryTarget) {
         if (primaryTarget == null) return WeaponMode.AXE;
 
-        // إذا كان السلاح مثبتاً ولم تنتهِ مهلة التثبيت بعد، نحافظ عليه لمنع تصفير شحن الهجوم (Charge Reset)
+        // حماية فورية من Sweeping Edge إذا اقترب القائد أو كيان أليف حتى لو كان السلاح مثبتاً
+        boolean friendlyNearSweep = hasFriendlyNearSweep(level, player, companion, primaryTarget);
+        if (friendlyNearSweep && hasAxe(player)) {
+            currentWeaponChoice = WeaponMode.AXE;
+            return WeaponMode.AXE;
+        }
+
         if (weaponChoiceLockTicks > 0) {
             return currentWeaponChoice;
         }
 
-        // البحث عن الأعداء في محيط 5.0 بلوكات من البوت
         List<LivingEntity> nearbyHostiles = getNearbyHostiles(level, player, 5.0);
 
         WeaponMode chosen = WeaponMode.AXE;
-        if (nearbyHostiles.size() >= 2) {
-            // فحص هل هناك أكثر من عدوين يقعان في نفس الجهة أمام البوت؟
+        if (!friendlyNearSweep && nearbyHostiles.size() >= 2) {
             Vec3 botPos = player.position();
             Vec3 botLook = player.getViewVector(1.0f);
             int enemiesInSameDir = 0;
 
             for (LivingEntity enemy : nearbyHostiles) {
-                Vec3 toEnemy = enemy.position().subtract(botPos).normalize();
-                double dot = botLook.dot(toEnemy);
+                Vec3 toEnemy = enemy.position().subtract(botPos);
+                double dot = toEnemy.lengthSqr() > 0.001 ? botLook.dot(toEnemy.normalize()) : 1.0;
                 if (dot >= 0.35 || enemy.distanceTo(primaryTarget) <= 2.5) {
                     enemiesInSameDir++;
                 }
@@ -384,7 +369,6 @@ public class BotCombatManager {
                 chosen = hasSword(player) ? WeaponMode.SWORD : WeaponMode.AXE;
             }
         } else {
-            // أعداء قليلة ومتفرقة: تفضيل الفأس
             if (hasAxe(player)) {
                 chosen = WeaponMode.AXE;
             } else {
@@ -393,20 +377,46 @@ public class BotCombatManager {
         }
 
         currentWeaponChoice = chosen;
-        weaponChoiceLockTicks = 30; // تثبيت السلاح لمدة ثانية ونصف
+        weaponChoiceLockTicks = 30;
         return chosen;
     }
 
+    private boolean hasFriendlyNearSweep(ClientLevel level, LocalPlayer player, Player companion, LivingEntity primaryTarget) {
+        if (level == null || player == null || primaryTarget == null) return false;
+        Vec3 botLook = player.getViewVector(1.0f);
+        Vec3 botPos = player.position();
+        AABB area = player.getBoundingBox().inflate(4.0);
+        for (LivingEntity le : level.getEntitiesOfClass(LivingEntity.class, area)) {
+            if (le == player || le == primaryTarget || !le.isAlive() || le.isRemoved()) continue;
+            boolean friendly = (companion != null && le == companion)
+                || (le instanceof Player p && (BotFriendManager.getInstance().isFriend(p) || BotFollowController.getInstance().isFollowingPlayer(p)))
+                || (le instanceof TamableAnimal tamed && tamed.isTame());
+            if (!friendly) continue;
+
+            if (le.distanceTo(primaryTarget) <= 2.6) {
+                return true;
+            }
+            if (le.distanceTo(player) <= 3.5) {
+                Vec3 toFriendly = le.position().subtract(botPos);
+                if (toFriendly.lengthSqr() > 0.001 && botLook.dot(toFriendly.normalize()) >= 0.15) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     /**
-     * تكتيك الكريبر: ضربة ثم هروب 10 بلوكات بأقصى سرعة
+     * تكتيك الكريبر: ضربة ثم هروب 10 بلوكات بأقصى سرعة مع حراسة مستمرة ضد الحفر والمخاطر
      */
-    private boolean executeCreeperTactics(Minecraft client, LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode, Creeper creeper, double distToCreeper) {
+    private boolean executeCreeperTactics(Minecraft client, LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode, Creeper creeper, double distToCreeper, double eyeDistToCreeper) {
         if (!creeper.isAlive() || creeper.isRemoved() || creeper.isDeadOrDying() || creeper.getHealth() <= 0) {
             hostileTargets.remove(creeper.getUUID());
             if (lockedTargetUUID != null && lockedTargetUUID.equals(creeper.getUUID())) {
                 lockedTargetUUID = null;
             }
             creeperState = CreeperCombatState.NONE;
+            combatNavigator.clearPathOnly();
             return false;
         }
 
@@ -416,64 +426,88 @@ public class BotCombatManager {
 
         if (creeperState == CreeperCombatState.APPROACH_AND_STRIKE) {
             ensureBestAxeInMainHand(player, gameMode);
-            client.options.keyUse.setDown(false);
-            if (player.isUsingItem() && player.getUseItem().is(Items.SHIELD)) {
-                gameMode.releaseUsingItem(player);
-                player.stopUsingItem();
-            }
+            releaseShield(client, player, gameMode);
 
-            smoothLookAt(player, creeper.getX(), creeper.getEyeY() - 0.15, creeper.getZ(), 60.0f);
             boolean isSwelling = creeper.getSwellDir() > 0;
+            boolean inReach = eyeDistToCreeper <= 2.95 && distToCreeper <= 3.6;
 
-            if (distToCreeper <= 3.2) {
-                if (player.onGround() && !isJumpingForAxeCrit && combatJumpCooldown <= 0 && BotFollowController.isCeilingClear(level, player.blockPosition())) {
+            if (inReach) {
+                smoothLookAt(player, creeper.getX(), creeper.getEyeY() - 0.15, creeper.getZ(), 50.0f);
+                combatNavigator.clearPathOnly();
+
+                boolean strikeNow = false;
+                if (BotNavigator.isEntityInWater(level, player) || player.onClimbable() || !BotNavigator.isCeilingClear(level, player.blockPosition())) {
+                    strikeNow = true;
+                    isJumpingForAxeCrit = false;
+                    axeCritTicks = 0;
+                } else if (player.onGround() && !isJumpingForAxeCrit && combatJumpCooldown <= 0) {
                     isJumpingForAxeCrit = true;
                     axeCritTicks = 0;
                     combatJumpCooldown = 12;
                     client.options.keyJump.setDown(true);
                     client.options.keyUp.setDown(distToCreeper > 1.8);
-                } else {
+                } else if (isJumpingForAxeCrit) {
                     client.options.keyJump.setDown(false);
                     axeCritTicks++;
                     boolean isFalling = player.getDeltaMovement().y < -0.01;
-                    boolean jumpTimeout = axeCritTicks > 12;
+                    boolean jumpTimeout = axeCritTicks > 10;
 
                     if (isFalling || jumpTimeout || isSwelling) {
-                        smoothLookAt(player, creeper.getX(), creeper.getEyeY() - 0.15, creeper.getZ(), 90.0f);
-                        gameMode.attack(player, creeper);
-                        player.swing(InteractionHand.MAIN_HAND);
+                        strikeNow = true;
+                    }
+                } else {
+                    strikeNow = true;
+                }
 
-                        if (!creeper.isAlive() || creeper.isRemoved() || creeper.isDeadOrDying() || creeper.getHealth() <= 0) {
-                            hostileTargets.remove(creeper.getUUID());
-                            if (lockedTargetUUID != null && lockedTargetUUID.equals(creeper.getUUID())) {
-                                lockedTargetUUID = null;
-                            }
-                            creeperState = CreeperCombatState.NONE;
-                            return false;
+                if (strikeNow) {
+                    smoothLookAt(player, creeper.getX(), creeper.getEyeY() - 0.15, creeper.getZ(), 50.0f);
+                    gameMode.attack(player, creeper);
+                    player.swing(InteractionHand.MAIN_HAND);
+                    BotNavigator.releaseJumpOrMaintainWaterBuoyancy(client, player, level, creeper);
+                    client.options.keyUp.setDown(false);
+
+                    if (!creeper.isAlive() || creeper.isRemoved() || creeper.isDeadOrDying() || creeper.getHealth() <= 0) {
+                        hostileTargets.remove(creeper.getUUID());
+                        if (lockedTargetUUID != null && lockedTargetUUID.equals(creeper.getUUID())) {
+                            lockedTargetUUID = null;
                         }
-
-                        // فور الضربة: الهروب السريع 10 بلوكات في الجهة المعاكسة
-                        creeperState = CreeperCombatState.FLEE_SPRINT_JUMP;
-                        creeperFleeStartPos = player.position();
-                        creeperFleeDir = BotFollowController.calculateCreeperEscapeDirection(level, player, creeper.position());
-                        creeperFleeTicks = 0;
+                        creeperState = CreeperCombatState.NONE;
+                        combatNavigator.clearPathOnly();
                         isJumpingForAxeCrit = false;
                         axeCritTicks = 0;
+                        return false;
                     }
+
+                    creeperState = CreeperCombatState.FLEE_SPRINT_JUMP;
+                    creeperFleeStartPos = player.position();
+                    creeperFleeDir = BotFollowController.calculateCreeperEscapeDirection(level, player, creeper.position());
+                    creeperFleeTicks = 0;
+                    isJumpingForAxeCrit = false;
+                    axeCritTicks = 0;
                 }
             } else {
-                client.options.keyDown.setDown(false);
-                client.options.keyUp.setDown(true);
-                client.options.keySprint.setDown(true);
-                player.setSprinting(true);
-                if (combatJumpCooldown <= 0 && BotFollowController.isObstacleDirectlyAhead(player, level, creeper.getX(), creeper.getZ()) && player.onGround() && BotFollowController.isCeilingClear(level, player.blockPosition())) {
-                    client.options.keyJump.setDown(true);
-                    combatJumpCooldown = 10;
-                } else {
-                    client.options.keyJump.setDown(false);
-                }
                 isJumpingForAxeCrit = false;
                 axeCritTicks = 0;
+                BotNavigator.NavResult navRes = combatNavigator.navigateTo(
+                    client,
+                    player,
+                    level,
+                    gameMode,
+                    creeper.position(),
+                    true,
+                    2.3,
+                    false,
+                    50.0f,
+                    true,
+                    2500
+                );
+                if (navRes == BotNavigator.NavResult.BLOCKED_UNREACHABLE) {
+                    unreachableTargets.put(creeper.getUUID(), 40);
+                    lockedTargetUUID = null;
+                    creeperState = CreeperCombatState.NONE;
+                    combatNavigator.reset(client);
+                    return false;
+                }
             }
             return true;
         }
@@ -487,10 +521,13 @@ public class BotCombatManager {
             double fledDist = player.position().distanceTo(creeperFleeStartPos);
             creeperFleeTicks++;
 
-            if (client.options.keyUse.isDown()) client.options.keyUse.setDown(false);
-            if (player.isUsingItem()) {
-                gameMode.releaseUsingItem(player);
-                player.stopUsingItem();
+            releaseShield(client, player, gameMode);
+
+            // إعادة تقييم مسار الهروب دورياً أو عند ظهور عائق/حافة خطرة أمام البوت
+            if (creeperFleeTicks % 5 == 0
+                || player.horizontalCollision
+                || BotNavigator.isHazardOrDropAhead(level, player, creeperFleeDir.x, creeperFleeDir.z)) {
+                creeperFleeDir = BotFollowController.calculateCreeperEscapeDirection(level, player, creeper.position());
             }
 
             float runYaw = (float) (Math.atan2(creeperFleeDir.z, creeperFleeDir.x) * 180.0 / Math.PI) - 90.0f;
@@ -499,25 +536,27 @@ public class BotCombatManager {
             player.yBodyRot = runYaw;
             player.setXRot(0.0f);
 
-            client.options.keyUp.setDown(true);
+            boolean pathSafeAhead = !BotNavigator.isHazardOrDropAhead(level, player, creeperFleeDir.x, creeperFleeDir.z);
+            client.options.keyUp.setDown(pathSafeAhead);
             client.options.keyDown.setDown(false);
             client.options.keyLeft.setDown(false);
             client.options.keyRight.setDown(false);
-            client.options.keySprint.setDown(true);
-            player.setSprinting(true);
+            client.options.keySprint.setDown(pathSafeAhead);
+            player.setSprinting(pathSafeAhead);
 
-            if (player.onGround() && combatJumpCooldown <= 0 && BotFollowController.isCeilingClear(level, player.blockPosition())) {
+            if (pathSafeAhead
+                && player.onGround()
+                && combatJumpCooldown <= 0
+                && BotNavigator.isSafeToJumpAhead(level, player, creeperFleeDir.x, creeperFleeDir.z)) {
                 client.options.keyJump.setDown(true);
                 combatJumpCooldown = 8;
             } else {
-                client.options.keyJump.setDown(false);
+                BotNavigator.releaseJumpOrMaintainWaterBuoyancy(client, player, level, null);
             }
 
             if (fledDist >= 10.0 || distToCreeper >= 12.0 || creeperFleeTicks > 45) {
-                client.options.keyUp.setDown(false);
-                client.options.keyJump.setDown(false);
-                client.options.keySprint.setDown(false);
-                player.setSprinting(false);
+                BotEquipmentHelper.releaseMovementKeys(client);
+                BotNavigator.maintainWaterBuoyancy(client, player, level, creeper);
                 creeperState = CreeperCombatState.ASSESS;
                 creeperAssessTicks = 0;
             }
@@ -525,12 +564,9 @@ public class BotCombatManager {
         }
 
         if (creeperState == CreeperCombatState.ASSESS) {
-            client.options.keyUp.setDown(false);
-            client.options.keyJump.setDown(false);
-            client.options.keySprint.setDown(false);
-            player.setSprinting(false);
-
-            smoothLookAt(player, creeper.getX(), creeper.getEyeY() - 0.15, creeper.getZ(), 85.0f);
+            BotEquipmentHelper.releaseMovementKeys(client);
+            BotNavigator.maintainWaterBuoyancy(client, player, level, creeper);
+            smoothLookAt(player, creeper.getX(), creeper.getEyeY() - 0.15, creeper.getZ(), 50.0f);
 
             if (!creeper.isAlive() || creeper.isRemoved() || creeper.isDeadOrDying() || creeper.getHealth() <= 0) {
                 hostileTargets.remove(creeper.getUUID());
@@ -561,29 +597,31 @@ public class BotCombatManager {
             return null;
         }
 
-        // إذا كان القائد يبتعد مسافة كبيرة جداً (> 14.0 بلوكة)، نتجاهل الأعداء البعيدين ولا ننظر إلا لعدو ملاصق ومكشوف للبوت للدفاع السريع
+        // إذا كان القائد يبتعد مسافة كبيرة جداً (> 14.0 بلوكة)، نتجاهل الأعداء البعيدين ولا ننظر إلا لعدو ملاصق في مدى الاشتباك المباشر للدفاع عن النفس
         if (distToCompanion > 14.0) {
             lockedTargetUUID = null;
             LivingEntity immediateMouth = null;
-            double minDistSq = 3.2 * 3.2;
+            double minEyeDist = 2.95;
             for (UUID uuid : hostileTargets.keySet()) {
                 LivingEntity target = findLivingEntityByUUID(level, player, uuid);
                 if (target != null && target.isAlive() && !target.isRemoved() && !target.isDeadOrDying() && target.getHealth() > 0 && !isFriendOrCompanion(target, player)) {
-                    double dSq = player.distanceToSqr(target);
-                    if (dSq <= minDistSq && player.hasLineOfSight(target)) {
-                        minDistSq = dSq;
+                    double eyeDist = BotEquipmentHelper.getEyeToHitboxDistance(player, target);
+                    if (eyeDist <= minEyeDist && player.distanceTo(target) <= 3.6 && player.hasLineOfSight(target)) {
+                        minEyeDist = eyeDist;
                         immediateMouth = target;
                     }
                 }
             }
-            return immediateMouth; // إذا لم يكن هناك عدو ملاصق، نرجع null فوراً ليلحق بالقائد!
+            return immediateMouth;
         }
 
-        // 1. إن كان هناك هدف مثبت وما زال في مدى الاشتباك والتركيز ومكشوفاً:
+        // 1. إن كان هناك هدف مثبت وما زال في مدى الاشتباك والتركيز ومكشوفاً وغير محظور الوصول:
         if (lockedTargetUUID != null && targetLockTicks > 0) {
             LivingEntity current = findLivingEntityByUUID(level, player, lockedTargetUUID);
             if (current != null && current.isAlive() && !current.isRemoved() && !current.isDeadOrDying() && current.getHealth() > 0 && !isFriendOrCompanion(current, player)) {
-                if (player.distanceTo(current) <= 12.0 && player.hasLineOfSight(current)) {
+                boolean blocked = unreachableTargets.containsKey(current.getUUID())
+                    && BotEquipmentHelper.getEyeToHitboxDistance(player, current) > 2.95;
+                if (!blocked && player.distanceTo(current) <= 16.0 && player.hasLineOfSight(current)) {
                     return current;
                 }
             }
@@ -615,9 +653,12 @@ public class BotCombatManager {
                 continue;
             }
 
-            // التأكد من وجود خط رؤية واضح للعدو حتى لا يشتبك مع أعداء في كهوف تحت الأرض أو خلف جدران مصمتة
-            boolean sight = player.hasLineOfSight(target) || (companion != null && companion.hasLineOfSight(target));
-            if (!sight) continue;
+            boolean blocked = unreachableTargets.containsKey(uuid)
+                && BotEquipmentHelper.getEyeToHitboxDistance(player, target) > 2.95;
+            if (blocked) continue;
+
+            // التأكد من وجود خط رؤية واضح من البوت حتى لا يشتبك مع أعداء خلف جدران مصمتة أو في كهوف
+            if (!player.hasLineOfSight(target)) continue;
 
             if (distToBotSq < minImmediateDistSq || distToCompSq < minImmediateDistSq) {
                 immediateThreat = target;
@@ -631,13 +672,15 @@ public class BotCombatManager {
             return immediateThreat;
         }
 
-        // 3. اختيار أقرب عدو حي ومكشوف للبوت أو القائد ضمن محيط 10.0 بلوكات
+        // 3. اختيار أقرب عدو حي ومكشوف للبوت ضمن محيط 16.0 بلوكة (يشمل الرماة والمعتدين المسجلين)
         LivingEntity nextTarget = null;
-        double bestDistSq = 10.0 * 10.0;
+        double bestDistSq = 16.0 * 16.0;
         for (UUID uuid : hostileTargets.keySet()) {
             LivingEntity target = findLivingEntityByUUID(level, player, uuid);
             if (target != null && target.isAlive() && !target.isRemoved() && !target.isDeadOrDying() && target.getHealth() > 0 && !isFriendOrCompanion(target, player)) {
-                if (player.hasLineOfSight(target)) {
+                boolean blocked = unreachableTargets.containsKey(uuid)
+                    && BotEquipmentHelper.getEyeToHitboxDistance(player, target) > 2.95;
+                if (!blocked && player.hasLineOfSight(target)) {
                     double distSq = player.distanceToSqr(target);
                     if (distSq < bestDistSq) {
                         bestDistSq = distSq;
@@ -670,13 +713,19 @@ public class BotCombatManager {
             }
         }
 
+        boolean compDamaged = false;
         if (companion != null) {
             float compHealth = companion.getHealth();
-            boolean compDamaged = companion.hurtTime > 0 || (lastCompanionHealth > 0 && compHealth < lastCompanionHealth - 0.01f);
+            compDamaged = companion.hurtTime > 0 || (lastCompanionHealth > 0 && compHealth < lastCompanionHealth - 0.01f);
             boolean compAttacking = companion.swinging || companion.swingTime > 0 || companion.attackAnim > 0;
 
             if (compDamaged || compAttacking) {
                 scanAndEnlistEnemies(client, player, level, companion, companion.position());
+            }
+            LivingEntity compHurtBy = companion.getLastHurtByMob();
+            if (compDamaged && compHurtBy != null && !isFriendOrCompanion(compHurtBy, player)
+                && (isHostileMob(compHurtBy) || compHurtBy instanceof Player)) {
+                registerHostileTarget(client, player, compHurtBy);
             }
             lastCompanionHealth = compHealth;
         }
@@ -685,19 +734,28 @@ public class BotCombatManager {
         boolean botDamaged = player.hurtTime > 0 || (lastPlayerHealth > 0 && botHealth < lastPlayerHealth - 0.01f);
         if (botDamaged) {
             scanAndEnlistEnemies(client, player, level, companion, player.position());
+            LivingEntity botHurtBy = player.getLastHurtByMob();
+            if (botHurtBy != null && !isFriendOrCompanion(botHurtBy, player)
+                && (isHostileMob(botHurtBy) || botHurtBy instanceof Player)) {
+                registerHostileTarget(client, player, botHurtBy);
+            }
         }
         lastPlayerHealth = botHealth;
 
-        // مقذوفات قادمة
+        // مقذوفات قادمة (تشمل مدى 16 بلوكة ونحو البوت أو القائد)
         Projectile incoming = findIncomingProjectile(level, player, companion);
         if (incoming != null) {
             arrowDefenseCooldown = 12;
-            if (incoming.getOwner() instanceof LivingEntity shooter && isHostileMob(shooter) && !isFriendOrCompanion(shooter, player)) {
+            if (incoming.getOwner() instanceof LivingEntity shooter && !isFriendOrCompanion(shooter, player)
+                && (isHostileMob(shooter) || shooter instanceof Player)) {
                 registerHostileTarget(client, player, shooter);
             }
         }
 
-        // مسح مستمر للمحيط كل 10 تكات (نصف ثانية) لرصد أي وحش يقترب دون تأخير
+        // رصد اللاعبين غير الأصدقاء فقط عند العدوان الفعلي (ضرب مباشر أو تصويب بقوس/نشاب)
+        scanAggressingPlayers(client, player, level, companion, botDamaged, compDamaged);
+
+        // مسح مستمر للمحيط كل 10 تكات (نصف ثانية) لرصد أي وحش عدائي يقترب دون تأخير
         if (enemyScanCooldown <= 0) {
             scanAndEnlistEnemies(client, player, level, companion, player.position());
             if (companion != null) {
@@ -707,8 +765,48 @@ public class BotCombatManager {
         }
     }
 
+    private void scanAggressingPlayers(Minecraft client, LocalPlayer player, ClientLevel level, Player companion, boolean botDamaged, boolean compDamaged) {
+        AABB box = player.getBoundingBox().inflate(16.0);
+        List<Player> nearbyPlayers = level.getEntitiesOfClass(Player.class, box,
+            p -> p != player && p != companion && p.isAlive() && !p.isRemoved() && !isFriendOrCompanion(p, player));
+
+        for (Player other : nearbyPlayers) {
+            if (other.isSpectator() || other.isCreative()) continue;
+            Vec3 otherEye = other.getEyePosition();
+            Vec3 otherLook = other.getViewVector(1.0f);
+
+            double distToBot = other.distanceTo(player);
+            Vec3 toBot = player.getEyePosition().subtract(otherEye);
+            double dotToBot = toBot.lengthSqr() > 0.001 ? otherLook.dot(toBot.normalize()) : 0.0;
+
+            double distToComp = companion != null ? other.distanceTo(companion) : Double.MAX_VALUE;
+            double dotToComp = 0.0;
+            if (companion != null) {
+                Vec3 toComp = companion.getEyePosition().subtract(otherEye);
+                dotToComp = toComp.lengthSqr() > 0.001 ? otherLook.dot(toComp.normalize()) : 0.0;
+            }
+
+            boolean swingingAtUs = (other.swinging || other.attackAnim > 0) && (
+                (distToBot <= 4.3 && dotToBot >= 0.55)
+                || (companion != null && distToComp <= 4.3 && dotToComp >= 0.55)
+                || (botDamaged && distToBot <= 5.0 && dotToBot >= 0.25)
+                || (compDamaged && companion != null && distToComp <= 5.0 && dotToComp >= 0.25)
+            );
+
+            ItemStack activeStack = other.isUsingItem() ? other.getUseItem() : ItemStack.EMPTY;
+            boolean aimingRangedWeapon = !activeStack.isEmpty()
+                && (activeStack.is(Items.BOW) || activeStack.is(Items.CROSSBOW))
+                && ((dotToBot >= 0.88 && distToBot <= 16.0 && other.hasLineOfSight(player))
+                    || (companion != null && dotToComp >= 0.88 && distToComp <= 16.0 && other.hasLineOfSight(companion)));
+
+            if (swingingAtUs || aimingRangedWeapon) {
+                registerHostileTarget(client, player, other);
+            }
+        }
+    }
+
     private void scanAndEnlistEnemies(Minecraft client, LocalPlayer player, ClientLevel level, Player companion, Vec3 center) {
-        AABB box = new AABB(center.x - 12.0, center.y - 4.0, center.z - 12.0, center.x + 12.0, center.y + 4.0, center.z + 12.0);
+        AABB box = new AABB(center.x - 16.0, center.y - 5.0, center.z - 16.0, center.x + 16.0, center.y + 5.0, center.z + 16.0);
         List<LivingEntity> list = level.getEntitiesOfClass(LivingEntity.class, box, e -> e != player && e != companion && e.isAlive() && !e.isRemoved() && !isFriendOrCompanion(e, player) && isHostileMob(e));
         for (LivingEntity hostile : list) {
             registerHostileTarget(client, player, hostile);
@@ -728,15 +826,22 @@ public class BotCombatManager {
     }
 
     private Projectile findIncomingProjectile(ClientLevel level, LocalPlayer player, Player companion) {
-        AABB box = player.getBoundingBox().inflate(12.0);
+        AABB box = player.getBoundingBox().inflate(16.0);
         List<Projectile> list = level.getEntitiesOfClass(Projectile.class, box, p -> p.isAlive() && !p.isRemoved() && !p.onGround());
         for (Projectile proj : list) {
             Vec3 motion = proj.getDeltaMovement();
-            if (motion.lengthSqr() < 0.05) continue;
-            Vec3 toPlayer = player.position().subtract(proj.position());
-            if (toPlayer.lengthSqr() > 144.0) continue;
-            if (motion.normalize().dot(toPlayer.normalize()) > 0.65) {
+            if (motion.lengthSqr() < 0.04) continue;
+            Vec3 normMotion = motion.normalize();
+
+            Vec3 toBot = player.getEyePosition().subtract(proj.position());
+            if (toBot.lengthSqr() <= 256.0 && normMotion.dot(toBot.normalize()) > 0.65) {
                 return proj;
+            }
+            if (companion != null) {
+                Vec3 toComp = companion.getEyePosition().subtract(proj.position());
+                if (toComp.lengthSqr() <= 256.0 && normMotion.dot(toComp.normalize()) > 0.65) {
+                    return proj;
+                }
             }
         }
         return null;
@@ -745,6 +850,7 @@ public class BotCombatManager {
     private void checkEnemyDefeated(LivingEntity enemy) {
         if (!enemy.isAlive() || enemy.isRemoved() || enemy.isDeadOrDying() || enemy.getHealth() <= 0) {
             hostileTargets.remove(enemy.getUUID());
+            unreachableTargets.remove(enemy.getUUID());
             if (lockedTargetUUID != null && lockedTargetUUID.equals(enemy.getUUID())) {
                 lockedTargetUUID = null;
                 targetLockTicks = 0;
@@ -755,6 +861,8 @@ public class BotCombatManager {
 
     public void resetCombat(Minecraft client) {
         hostileTargets.clear();
+        unreachableTargets.clear();
+        combatNavigator.reset(client);
         lockedTargetUUID = null;
         targetLockTicks = 0;
         weaponChoiceLockTicks = 0;
@@ -808,10 +916,31 @@ public class BotCombatManager {
         if (shieldSwapCooldown > 0) return;
         ItemStack offhand = player.getOffhandItem();
         boolean shieldDisabled = offhand.is(Items.SHIELD) && player.getCooldowns().isOnCooldown(offhand);
-        if (!shieldDisabled) return;
+        boolean lowDurability = BotEquipmentHelper.isOffhandShieldLowDurability(player);
+        if (!shieldDisabled && !lowDurability) return;
 
         shieldSwapCooldown = 20;
         BotEquipmentHelper.swapBackupShieldToOffhand(player, gameMode, true, true);
+    }
+
+    private void raiseShield(Minecraft client, LocalPlayer player, MultiPlayerGameMode gameMode) {
+        if (!BotEquipmentHelper.isShieldReady(player)) {
+            releaseShield(client, player, gameMode);
+            return;
+        }
+        client.options.keyUse.setDown(true);
+        if (!player.isUsingItem() && gameMode != null) {
+            gameMode.useItem(player, InteractionHand.OFF_HAND);
+        }
+    }
+
+    private void releaseShield(Minecraft client, LocalPlayer player, MultiPlayerGameMode gameMode) {
+        if (client != null && client.options != null) {
+            client.options.keyUse.setDown(false);
+        }
+        if (player != null && player.isUsingItem() && player.getUsedItemHand() == InteractionHand.OFF_HAND && gameMode != null) {
+            gameMode.releaseUsingItem(player);
+        }
     }
 
     private LivingEntity findLivingEntityByUUID(ClientLevel level, LocalPlayer player, UUID uuid) {
@@ -837,7 +966,7 @@ public class BotCombatManager {
             return BotFriendManager.getInstance().isFriend(p);
         }
         if (entity instanceof net.minecraft.world.entity.decoration.ArmorStand) return true;
-        if (entity instanceof net.minecraft.world.entity.TamableAnimal tamed && tamed.isTame()) return true;
+        if (entity instanceof TamableAnimal tamed && tamed.isTame()) return true;
         return false;
     }
 
@@ -857,27 +986,7 @@ public class BotCombatManager {
     }
 
     private void smoothLookAt(LocalPlayer player, double targetX, double targetY, double targetZ, float maxTurnDegrees) {
-        double dx = targetX - player.getX();
-        double dy = targetY - player.getEyeY();
-        double dz = targetZ - player.getZ();
-        double distXZ = Math.sqrt(dx * dx + dz * dz);
-
-        float targetYaw = (float) (Math.atan2(dz, dx) * 180.0 / Math.PI) - 90.0f;
-        float targetPitch = (float) -(Math.atan2(dy, distXZ) * 180.0 / Math.PI);
-
-        float currentYaw = player.getYRot();
-        float currentPitch = player.getXRot();
-
-        float yawDiff = wrapDegrees(targetYaw - currentYaw);
-        float pitchDiff = wrapDegrees(targetPitch - currentPitch);
-
-        float clampedYaw = Math.max(-maxTurnDegrees, Math.min(maxTurnDegrees, yawDiff));
-        float clampedPitch = Math.max(-maxTurnDegrees, Math.min(maxTurnDegrees, pitchDiff));
-
-        player.setYRot(currentYaw + clampedYaw);
-        player.setXRot(currentPitch + clampedPitch);
-        player.yHeadRot = player.getYRot();
-        player.yBodyRot = player.getYRot();
+        BotEquipmentHelper.smoothLookAt(player, targetX, targetY, targetZ, maxTurnDegrees);
     }
 
     public static float wrapDegrees(float degrees) {
