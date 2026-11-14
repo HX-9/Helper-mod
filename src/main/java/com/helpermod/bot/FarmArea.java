@@ -8,16 +8,31 @@ import java.util.Map;
 
 public class FarmArea {
     private String name;
-    private final BlockPos minPos;
-    private final BlockPos maxPos;
+    private BlockPos minPos;
+    private BlockPos maxPos;
     private FarmCrop targetCrop; // null indicates AUTO (replant what was there)
     private BlockPos chestPos; // صندوق تفريغ المحصول المخصص لهذه المزرعة
+    private boolean enabled = true; // هل المزرعة مفعلة للعمل أم لا
     private final Map<BlockPos, FarmCrop> rememberedCrops = new HashMap<>();
 
     public FarmArea(String name, BlockPos p1, BlockPos p2, FarmCrop targetCrop) {
         this.name = name;
+        this.targetCrop = targetCrop;
+        updateBounds(p1, p2);
+    }
+
+    public FarmArea(String name, BlockPos minPos, BlockPos maxPos, FarmCrop targetCrop, boolean isExact) {
+        this.name = name;
+        this.minPos = minPos;
+        this.maxPos = maxPos;
+        this.targetCrop = targetCrop;
+    }
+
+    /**
+     * تحديث حدود المنطقة مع توسيع نطاق Y تلقائياً ليشمل التربة والمحاصيل فوقها.
+     */
+    public void updateBounds(BlockPos p1, BlockPos p2) {
         int minX = Math.min(p1.getX(), p2.getX());
-        // توسيع نطاق Y تلقائياً بهامش مناسب لضمان شمول المحاصيل فوق التربة والتربة تحتها
         int minY = Math.min(p1.getY(), p2.getY()) - 2;
         int minZ = Math.min(p1.getZ(), p2.getZ());
         int maxX = Math.max(p1.getX(), p2.getX());
@@ -26,14 +41,6 @@ public class FarmArea {
 
         this.minPos = new BlockPos(minX, minY, minZ);
         this.maxPos = new BlockPos(maxX, maxY, maxZ);
-        this.targetCrop = targetCrop;
-    }
-
-    public FarmArea(String name, BlockPos minPos, BlockPos maxPos, FarmCrop targetCrop, boolean isExact) {
-        this.name = name;
-        this.minPos = minPos;
-        this.maxPos = maxPos;
-        this.targetCrop = targetCrop;
     }
 
     public String getName() {
@@ -66,6 +73,14 @@ public class FarmArea {
 
     public void setChestPos(BlockPos chestPos) {
         this.chestPos = chestPos != null ? chestPos.immutable() : null;
+    }
+
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    public void setEnabled(boolean enabled) {
+        this.enabled = enabled;
     }
 
     public boolean contains(BlockPos pos) {

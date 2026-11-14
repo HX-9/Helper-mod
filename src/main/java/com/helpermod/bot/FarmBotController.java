@@ -1,5 +1,6 @@
 package com.helpermod.bot;
 
+import com.helpermod.bot.food.BotFoodManager;
 import com.helpermod.bot.path.FarmPathfinder;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
@@ -8,11 +9,11 @@ import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.network.chat.Component;
-import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.item.HoeItem;
 import net.minecraft.world.item.ItemStack;
@@ -32,6 +33,8 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -103,13 +106,14 @@ public class FarmBotController {
     // الخانة المخصصة للبذور في شريط الأدوات: الزر رقم 7 في لوحة المفاتيح يقابل الفهرس 6
     private static final int SEED_HOTBAR_SLOT = 6;
 
-    // الخانة المخصصة للطعام (البطاطا المطبوخة) في شريط الأدوات: الزر رقم 9 في لوحة المفاتيح يقابل الفهرس 8
+    // الخانة المخصصة للطعام في شريط الأدوات: الزر رقم 9 في لوحة المفاتيح يقابل الفهرس 8
     private static final int FOOD_HOTBAR_SLOT = 8;
 
-    // تتبع تناول البطاطا المطبوخة
+    // تتبع تناول الطعام المسموح عبر BotFoodManager
     private boolean isEating = false;
     private int eatingTicks = 0;
     private int lastFoodLevel = -1;
+    private int hungryAlertCooldown = 0;
 
     // تسلسل مراحل العمل المنظمة لكل مزرعة
     public enum FarmStage {
@@ -148,6 +152,9 @@ public class FarmBotController {
     private FarmArea targetDepositArea = null;
     private int depositTimeoutTicks = 0;
     private final Set<BlockPos> visitedDepositChests = new HashSet<>();
+    private final Set<FarmCrop> lastDepositTargetCrops = EnumSet.noneOf(FarmCrop.class);
+    private final Set<FarmCrop> lastDepositExcludedCrops = EnumSet.noneOf(FarmCrop.class);
+    private boolean lastDepositAllowUnmappedFarmItems = false;
 
     // تتبع تحويل الفائض لسماد في الكومبوستر عند امتلاء الصناديق
     private final Set<FarmCrop> fullChestCrops = new HashSet<>();
@@ -225,7 +232,11 @@ public class FarmBotController {
         }
         List<FarmArea> areas = FarmAreaManager.getInstance().getActiveAreas();
         if (areas.isEmpty()) {
-            sendChatMessage(client, "§c[Bot] لا توجد مناطق زراعية محددة! أضف منطقة أولاً باستخدام: /bot farm area pos1 ثم pos2 ثم create <اسم>");
+            if (FarmAreaManager.getInstance().getAllAreas().isEmpty()) {
+                sendChatMessage(client, "§c[Bot] لا توجد مناطق زراعية محددة! أضف منطقة أولاً باستخدام: /bot farm area pos1 ثم pos2 ثم create <اسم>");
+            } else {
+                sendChatMessage(client, "§c[Bot] جميع المزارع المسجلة حالياً غير مفعلة! فعّل مزرعة أو الكل عبر: §e/bot farm area enable <الاسم|all>");
+            }
             return;
         }
         running = true;
@@ -234,6 +245,10 @@ public class FarmBotController {
             BotFollowController.getInstance().stopFollowing(client);
         }
         fullChestPausedFarms.clear();
+        visitedDepositChests.clear();
+        lastDepositTargetCrops.clear();
+        lastDepositExcludedCrops.clear();
+        lastDepositAllowUnmappedFarmItems = false;
         depositCloseDelay = 0;
         withdrawCloseDelay = 0;
         isDriving = false;
@@ -252,6 +267,7 @@ public class FarmBotController {
         isEating = false;
         eatingTicks = 0;
         lastFoodLevel = -1;
+        hungryAlertCooldown = 0;
         currentPath = null;
         currentGoal = null;
         nightTicks = 0;
@@ -285,6 +301,9 @@ public class FarmBotController {
         }
 
         sendChatMessage(client, "§a[Bot] تم تشغيل المساعد الآلي للزراعة! بدء دورة العمل المنظمة بالمزارع...");
+        if (!BotGlobalManager.getInstance().isBotEnabled()) {
+            sendChatMessage(client, "§e[Bot] تنبيه: الوضع العام للمود متوقف حالياً (/bot mode off). فعّله عبر: §b/bot mode on");
+        }
     }
 
     public void stop(Minecraft client) {
@@ -304,11 +323,15 @@ public class FarmBotController {
         isEating = false;
         eatingTicks = 0;
         lastFoodLevel = -1;
+        hungryAlertCooldown = 0;
         nightTicks = 0;
         bedAlertSent = false;
         targetDepositArea = null;
         depositTimeoutTicks = 0;
         visitedDepositChests.clear();
+        lastDepositTargetCrops.clear();
+        lastDepositExcludedCrops.clear();
+        lastDepositAllowUnmappedFarmItems = false;
         targetWithdrawArea = null;
         targetWithdrawCrop = null;
         withdrawTimeoutTicks = 0;
@@ -390,6 +413,9 @@ public class FarmBotController {
         if (hoeAlertTicks > 0) {
             hoeAlertTicks--;
         }
+        if (hungryAlertCooldown > 0) {
+            hungryAlertCooldown--;
+        }
 
         // التعامل مع إغلاق الأبواب بعد العبور (التوقف التام والالتفاف وإغلاق الباب ثم مواصلة الطريق)
         if (handleDoorState(client, player, level, gameMode)) {
@@ -446,12 +472,18 @@ public class FarmBotController {
             }
         }
 
-        // معالجة تناول الطعام إذا كان الجوع 14 أو أقل، أو الاستمرار في الأكل حبة تلو الأخرى حتى الشبع التام (20)
+        // معالجة تناول الطعام المسموح إذا كان الجوع 14 أو أقل، أو الاستمرار في الأكل، أو العلاج بالتفاح الذهبي المسموح
         int currentFood = player.getFoodData().getFoodLevel();
-        if ((currentFood <= 14 || isEating) && hasBakedPotato(player)) {
-            boolean eating = handleEating(client, player, gameMode);
-            if (eating) {
-                return;
+        boolean shouldEatNow = currentFood <= 14 || isEating || (player.getHealth() <= 14.0f && BotFoodManager.getInstance().hasEdibleAllowedFood(player));
+        if (shouldEatNow) {
+            if (BotFoodManager.getInstance().hasEdibleAllowedFood(player)) {
+                boolean eating = handleEating(client, player, gameMode);
+                if (eating) {
+                    return;
+                }
+            } else if (player.getFoodData().needsFood() && currentFood <= 14 && hungryAlertCooldown <= 0) {
+                hungryAlertCooldown = 1200; // دقيقة واحدة
+                sendChatMessage(client, "§c[Bot] أنا جائع ولا أملك أي طعام مسموح به في الحقيبة! أضف طعاماً عبر: §e/bot food add <name>");
             }
         }
 
@@ -614,9 +646,9 @@ public class FarmBotController {
                                 if (isInventoryFull(player)) {
                                     List<FarmArea> activeAreas = FarmAreaManager.getInstance().getActiveAreas();
                                     visitedDepositChests.clear();
-                                    FarmArea depositFarm = findAreaNeedingDeposit(player, activeAreas);
+                                    FarmArea depositFarm = findAreaNeedingDeposit(player, level, activeAreas);
                                     if (depositFarm != null) {
-                                        sendChatMessage(client, "§e[Bot] المخزون ممتلئ أثناء تجميع المحاصيل! يتوجه لتفريغ محصول (" + depositFarm.getCropDisplayName() + ") في صندوق مزرعة §a" + depositFarm.getName() + "§e مع الاحتفاظ بـ 64 بذرة...");
+                                        sendChatMessage(client, "§e[Bot] المخزون ممتلئ أثناء تجميع المحاصيل! يتوجه لتفريغ المحاصيل بدءاً بصندوق مزرعة §a" + depositFarm.getName() + "§e مع الاحتفاظ بـ 64 بذرة...");
                                         targetDepositArea = depositFarm;
                                         currentStage = FarmStage.DEPOSIT;
                                         currentPath = null;
@@ -787,8 +819,8 @@ public class FarmBotController {
                     targetStuckTicks = 0;
                     physicalStuckTicks = 0;
 
-                    // إذا كان جوعه ناقصاً عن الامتلاء التام ولديه بطاطا مطبوخة، يتناول الطعام حتى يملأ العداد بالكامل بعد انتهاء المزرعة
-                    if (player.getFoodData().needsFood() && hasBakedPotato(player)) {
+                    // إذا كان جوعه ناقصاً عن الامتلاء التام ولديه طعام مسموح، يتناول الطعام بعد انتهاء المزرعة
+                    if (player.getFoodData().needsFood() && BotFoodManager.getInstance().hasEdibleAllowedFood(player)) {
                         boolean eating = handleEating(client, player, gameMode);
                         if (eating) {
                             return;
@@ -810,12 +842,12 @@ public class FarmBotController {
                         return;
                     }
 
-                    // إذا امتلأ المخزون بالكامل، ينهي المزرعة الحالية ثم يتوجه للصناديق لتفريغ المحصول والاحتفاظ بـ 64 حبة
+                    // إذا امتلأ المخزون بالكامل، ينهي المزرعة الحالية ثم يتوجه للصناديق لتفريغ المحاصيل والاحتفاظ بـ 64 حبة
                     if (isInventoryFull(player)) {
                         visitedDepositChests.clear();
-                        FarmArea depositFarm = findAreaNeedingDeposit(player, areas);
+                        FarmArea depositFarm = findAreaNeedingDeposit(player, level, areas);
                         if (depositFarm != null) {
-                            sendChatMessage(client, "§e[Bot] المخزون ممتلئ واكتملت المزرعة الحالية! يتوجه لتفريغ المحاصيل في صناديقها المخصصة بدءاً بمزرعة §a" + depositFarm.getName() + "§e (" + depositFarm.getCropDisplayName() + ")...");
+                            sendChatMessage(client, "§e[Bot] المخزون ممتلئ واكتملت المزرعة الحالية! يتوجه لتفريغ المحاصيل بدءاً بصندوق مزرعة §a" + depositFarm.getName() + "§e...");
                             targetDepositArea = depositFarm;
                             currentStage = FarmStage.DEPOSIT;
                             currentPath = null;
@@ -855,9 +887,9 @@ public class FarmBotController {
                         }
                         if (isInventoryFull(player)) {
                             visitedDepositChests.clear();
-                            FarmArea depositFarm = findAreaNeedingDeposit(player, areas);
+                            FarmArea depositFarm = findAreaNeedingDeposit(player, level, areas);
                             if (depositFarm != null) {
-                                sendChatMessage(client, "§e[Bot] المخزون ممتلئ! يتوجه لتفريغ المحاصيل في صناديقها المخصصة بدءاً بمزرعة §a" + depositFarm.getName() + "§e (" + depositFarm.getCropDisplayName() + ")...");
+                                sendChatMessage(client, "§e[Bot] المخزون ممتلئ! يتوجه لتفريغ المحاصيل بدءاً بصندوق مزرعة §a" + depositFarm.getName() + "§e...");
                                 targetDepositArea = depositFarm;
                                 currentStage = FarmStage.DEPOSIT;
                                 currentPath = null;
@@ -1563,12 +1595,7 @@ public class FarmBotController {
     }
 
     private void selectHotbarSlot(LocalPlayer player, int slot) {
-        if (slot >= 0 && slot < 9) {
-            player.getInventory().setSelectedSlot(slot);
-            if (player.connection != null) {
-                player.connection.send(new ServerboundSetCarriedItemPacket(slot));
-            }
-        }
+        BotEquipmentHelper.selectHotbarSlot(player, slot);
     }
 
     private void moveTo(Minecraft client, LocalPlayer player, ClientLevel level, double tx, double ty, double tz, double stopDist) {
@@ -1723,14 +1750,7 @@ public class FarmBotController {
     }
 
     private float wrapDegrees(float degrees) {
-        float f = degrees % 360.0f;
-        if (f >= 180.0f) {
-            f -= 360.0f;
-        }
-        if (f < -180.0f) {
-            f += 360.0f;
-        }
-        return f;
+        return BotEquipmentHelper.wrapDegrees(degrees);
     }
 
     private TargetAction findClosestHarvestTargetInArea(LocalPlayer player, ClientLevel level, FarmArea area) {
@@ -2020,67 +2040,20 @@ public class FarmBotController {
     }
 
     /**
-     * التأكد من وجود البطاطا المطبوخة في خانة الزر رقم 9 (الفهرس 8).
-     * إذا لم تكن موجودة في الزر 9 وكانت في مكان آخر بالهوتبار أو بالحقيبة، يتم نقلها وتبديلها مع الزر 9 تلقائياً.
+     * العثور على أفضل طعام مسموح وصالح للأكل في شريط الأدوات أو نقله للخانة 9 (الفهرس 8).
      */
     private int ensureFoodInHotbar(Minecraft client, LocalPlayer player, MultiPlayerGameMode gameMode) {
-        ItemStack slot9 = player.getInventory().getItem(FOOD_HOTBAR_SLOT);
-        if (!slot9.isEmpty() && slot9.is(net.minecraft.world.item.Items.BAKED_POTATO)) {
-            return FOOD_HOTBAR_SLOT;
-        }
-
-        int containerId = player.inventoryMenu.containerId;
-
-        // 1. فحص باقي خانات شريط الأدوات (0 إلى 7)
-        for (int i = 0; i < 8; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.is(net.minecraft.world.item.Items.BAKED_POTATO)) {
-                gameMode.handleContainerInput(containerId, 36 + i, FOOD_HOTBAR_SLOT, ContainerInput.SWAP, player);
-                return FOOD_HOTBAR_SLOT;
-            }
-        }
-
-        // 2. فحص الحقيبة الرئيسية (الخانات 9 إلى 35)
-        for (int i = 9; i < 36; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.is(net.minecraft.world.item.Items.BAKED_POTATO)) {
-                gameMode.handleContainerInput(containerId, i, FOOD_HOTBAR_SLOT, ContainerInput.SWAP, player);
-                return FOOD_HOTBAR_SLOT;
-            }
-        }
-
-        return -1;
-    }
-
-    private boolean hasBakedPotato(LocalPlayer player) {
-        Inventory inv = player.getInventory();
-        for (int i = 0; i < inv.getContainerSize(); i++) {
-            ItemStack stack = inv.getItem(i);
-            if (!stack.isEmpty() && stack.is(net.minecraft.world.item.Items.BAKED_POTATO)) {
-                return true;
-            }
-        }
-        return false;
+        return BotFoodManager.getInstance().ensureBestFoodInHotbar(player, gameMode, FOOD_HOTBAR_SLOT, SEED_HOTBAR_SLOT);
     }
 
     /**
-     * معالجة تناول البطاطا المطبوخة حبة تلو الأخرى حتى يمتلئ عداد الجوع بالكامل (20)
+     * معالجة تناول الطعام المسموح حبة تلو الأخرى حتى الامتلاء أو انتهاء الحاجة للأكل.
      */
     private boolean handleEating(Minecraft client, LocalPlayer player, MultiPlayerGameMode gameMode) {
         int foodLevel = player.getFoodData().getFoodLevel();
+        BotFoodManager foodMgr = BotFoodManager.getInstance();
 
-        // إذا امتلأ عداد الجوع تماماً (20)، أو لم يعد جائعاً: إنهاء الأكل
-        if (foodLevel >= 20 || !player.getFoodData().needsFood()) {
-            if (isEating) {
-                client.options.keyUse.setDown(false);
-                isEating = false;
-                eatingTicks = 0;
-                lastFoodLevel = -1;
-            }
-            return false;
-        }
-
-        if (!hasBakedPotato(player)) {
+        if (!foodMgr.hasEdibleAllowedFood(player)) {
             if (isEating) {
                 client.options.keyUse.setDown(false);
                 isEating = false;
@@ -2101,8 +2074,8 @@ public class FarmBotController {
             return false;
         }
 
-        if (player.getInventory().getSelectedSlot() != FOOD_HOTBAR_SLOT) {
-            selectHotbarSlot(player, FOOD_HOTBAR_SLOT);
+        if (player.getInventory().getSelectedSlot() != foodSlot) {
+            selectHotbarSlot(player, foodSlot);
         }
 
         // إذا تم ابتلاع حبة بنجاح (زاد مستوى الجوع): تصفير عداد الحبة الحالية للبدء بالحبة التالية
@@ -2528,7 +2501,14 @@ public class FarmBotController {
             }
 
             if (depositCloseDelay == 0) {
-                lastDepositedCount = depositSurplusIntoOpenChest(player, gameMode, targetDepositArea);
+                List<FarmArea> activeAreas = FarmAreaManager.getInstance().getActiveAreas();
+                DepositPlan plan = buildDepositPlan(targetDepositArea, activeAreas, level, visitedDepositChests);
+                lastDepositTargetCrops.clear();
+                lastDepositTargetCrops.addAll(plan.targetCrops());
+                lastDepositExcludedCrops.clear();
+                lastDepositExcludedCrops.addAll(plan.excludedCropsWithOtherChests());
+                lastDepositAllowUnmappedFarmItems = plan.allowUnmappedFarmItems();
+                lastDepositedCount = depositSurplusIntoOpenChest(player, gameMode, plan);
                 depositCloseDelay = 4; // انتظار 4 نبضات لضمان معالجة السيرفر لحزم الإيداع
                 return;
             }
@@ -2539,22 +2519,32 @@ public class FarmBotController {
             }
 
             depositCloseDelay = 0;
-            // إغلاق الصندوق بعد الانتهاء من إيداع المحصول الخاص به
+            // إغلاق الصندوق بعد الانتهاء من إيداع المحاصيل المحددة له
             player.closeContainer();
 
             int deposited = lastDepositedCount;
 
-            // فحص هل بقي فائض لهذا المحصول لم يتسع له الصندوق (الصندوق ممتلئ)
-            FarmCrop areaCrop = getEffectiveCrop(targetDepositArea);
-            if (areaCrop != null && hasCropSurplus(player, areaCrop)) {
-                fullChestCrops.add(areaCrop);
-                sendChatMessage(client, "§6[Bot] صندوق مزرعة §e" + targetDepositArea.getName() + "§6 ممتلئ ولا يتسع لفائض محصول §e" + areaCrop.getArabicName() + "§6!");
+            // فحص هل بقي فائض لأي من المحاصيل التي كان ينبغي وضعها في هذا الصندوق (الصندوق ممتلئ)
+            Set<FarmCrop> checkedCrops = EnumSet.noneOf(FarmCrop.class);
+            checkedCrops.addAll(lastDepositTargetCrops);
+            if (lastDepositAllowUnmappedFarmItems) {
+                for (FarmCrop c : FarmCrop.values()) {
+                    if (!lastDepositExcludedCrops.contains(c)) {
+                        checkedCrops.add(c);
+                    }
+                }
+            }
+            for (FarmCrop crop : checkedCrops) {
+                if (hasCropSurplus(player, crop)) {
+                    fullChestCrops.add(crop);
+                    sendChatMessage(client, "§6[Bot] صندوق مزرعة §e" + targetDepositArea.getName() + "§6 ممتلئ ولا يتسع لفائض محصول §e" + crop.getArabicName() + "§6!");
+                }
             }
 
             if (deposited > 0) {
-                sendChatMessage(client, "§a[Bot] تم تفريغ فائض محصول §e" + targetDepositArea.getCropDisplayName() + "§a (" + deposited + " حزمة) في صندوق مزرعة §e" + targetDepositArea.getName() + "§a بنجاح مع الاحتفاظ بـ 64 بذرة!");
+                sendChatMessage(client, "§a[Bot] تم تفريغ فائض المحاصيل (" + deposited + " حزمة) في صندوق مزرعة §e" + targetDepositArea.getName() + "§a بنجاح مع الاحتفاظ بـ 64 بذرة!");
             } else {
-                sendChatMessage(client, "§e[Bot] تم فحص صندوق مزرعة §e" + targetDepositArea.getName() + "§e؛ لا توجد محاصيل مطابقة له أو الصندوق ممتلئ!");
+                sendChatMessage(client, "§e[Bot] تم فحص صندوق مزرعة §e" + targetDepositArea.getName() + "§e؛ لا توجد محاصيل إضافية لتفريغها أو الصندوق ممتلئ!");
             }
 
             // إضافة هذا الصندوق لقائمة الصناديق التي تمت زيارتها في هذه الجولة لمنع تكراره
@@ -2562,11 +2552,11 @@ public class FarmBotController {
 
             // فحص هل ما زال لدى اللاعب محاصيل أخرى فائضة تنتمي لصناديق مزارع أخرى لم نزرها بعد
             List<FarmArea> activeAreas = FarmAreaManager.getInstance().getActiveAreas();
-            FarmArea nextFarm = findAreaNeedingDeposit(player, activeAreas, visitedDepositChests);
+            FarmArea nextFarm = findAreaNeedingDeposit(player, level, activeAreas, visitedDepositChests);
 
             if (nextFarm != null) {
-                // الانتقال فوراً للصندوق التالي الخاص بنوع المحصول الآخر
-                sendChatMessage(client, "§6[Bot] يتوجه الآن إلى صندوق مزرعة §e" + nextFarm.getName() + "§6 لتفريغ نوع المحصول الخاص بها: §e" + nextFarm.getCropDisplayName() + "§6...");
+                // الانتقال فوراً للصندوق التالي
+                sendChatMessage(client, "§6[Bot] يتوجه الآن إلى صندوق مزرعة §e" + nextFarm.getName() + "§6 لتفريغ باقي المحاصيل...");
                 targetDepositArea = nextFarm;
                 depositTimeoutTicks = 0;
                 currentPath = null;
@@ -2575,52 +2565,7 @@ public class FarmBotController {
                 return;
             }
 
-            // انتهت كافة الصناديق: فحص هل توجد محاصيل امتلأت صناديقها ولدينا فائض يمكن تحويله لسماد
-            if (!fullChestCrops.isEmpty() && hasAnyCompostableSurplus(player, fullChestCrops)) {
-                BlockPos composter = findNearbyComposter(player, level, 36);
-                if (composter != null) {
-                    sendChatMessage(client, "§e[Bot] لم يجد مساحة في صندوق المورد! يتوجه الآن إلى أقرب كومبوستر لتحويل الفائض إلى سماد...");
-                    targetComposterPos = composter;
-                    currentStage = FarmStage.COMPOST;
-                    compostTimeoutTicks = 0;
-                    currentPath = null;
-                    currentGoal = null;
-                    visitedDepositChests.clear();
-                    targetDepositArea = null;
-                    depositTimeoutTicks = 0;
-                    cooldownTicks = 15;
-                    return;
-                } else {
-                    sendChatMessage(client, "§c[Bot] صناديق الموارد ممتلئة ولكن لم يتم العثور على أي كومبوستر قريب في المحيط (نطاق 36 بلوكة)!");
-                }
-            }
-
-            // إذا بقيت محاصيل امتلأت صناديقها ولا يمكن تسميدها أو لم يوجد كومبوستر
-            if (!fullChestCrops.isEmpty()) {
-                for (FarmArea area : activeAreas) {
-                    FarmCrop c = getEffectiveCrop(area);
-                    if (c != null && fullChestCrops.contains(c)) {
-                        fullChestPausedFarms.add(area.getName());
-                        sendChatMessage(client, "§c[Bot] تم إيقاف العمل في مزرعة §e" + area.getName() + "§c (" + c.getArabicName() + ") مؤقتاً لامتلاء صندوقها وعدم توفر أداة سماد لتفريغ الفائض.");
-                    }
-                }
-                fullChestCrops.clear();
-
-                if (fullChestPausedFarms.containsAll(activeAreas.stream().map(FarmArea::getName).toList())) {
-                    sendChatMessage(client, "§c[Bot] تم إيقاف جميع المزارع مؤقتاً لامتلاء صناديقها وعدم توفر أداة سماد! إيقاف البوت لحين إفراغ الصناديق.");
-                    stop(client);
-                    return;
-                }
-            }
-
-            // انتهت كافة الصناديق ولا توجد أي محاصيل أخرى بحاجة لتفريغ
-            fullChestCrops.clear();
-            visitedDepositChests.clear();
-            targetDepositArea = null;
-            depositTimeoutTicks = 0;
-            currentStage = FarmStage.HARVEST;
-            cooldownTicks = 20;
-            sendChatMessage(client, "§a[Bot] اكتمل فرز وتفريغ كافة المحاصيل كل نوع في صندوقه الخاص! استئناف دورة الزراعة...");
+            handlePostDepositFullChests(client, player, level, activeAreas);
             return;
         } else {
             depositCloseDelay = 0;
@@ -2632,7 +2577,7 @@ public class FarmBotController {
             sendChatMessage(client, "§c[Bot] تعذر فتح صندوق مزرعة §e" + targetDepositArea.getName() + "§c! فحص الصناديق التالية...");
             visitedDepositChests.add(chestPos);
             List<FarmArea> activeAreas = FarmAreaManager.getInstance().getActiveAreas();
-            FarmArea nextFarm = findAreaNeedingDeposit(player, activeAreas, visitedDepositChests);
+            FarmArea nextFarm = findAreaNeedingDeposit(player, level, activeAreas, visitedDepositChests);
             if (nextFarm != null) {
                 targetDepositArea = nextFarm;
                 depositTimeoutTicks = 0;
@@ -2640,41 +2585,7 @@ public class FarmBotController {
                 currentGoal = null;
                 return;
             }
-            if (!fullChestCrops.isEmpty() && hasAnyCompostableSurplus(player, fullChestCrops)) {
-                BlockPos composter = findNearbyComposter(player, level, 36);
-                if (composter != null) {
-                    sendChatMessage(client, "§e[Bot] يتوجه الآن إلى أقرب كومبوستر لتحويل الفائض إلى سماد...");
-                    targetComposterPos = composter;
-                    currentStage = FarmStage.COMPOST;
-                    compostTimeoutTicks = 0;
-                    currentPath = null;
-                    currentGoal = null;
-                    visitedDepositChests.clear();
-                    targetDepositArea = null;
-                    depositTimeoutTicks = 0;
-                    return;
-                }
-            }
-            if (!fullChestCrops.isEmpty()) {
-                for (FarmArea area : activeAreas) {
-                    FarmCrop c = getEffectiveCrop(area);
-                    if (c != null && fullChestCrops.contains(c)) {
-                        fullChestPausedFarms.add(area.getName());
-                        sendChatMessage(client, "§c[Bot] تم إيقاف العمل في مزرعة §e" + area.getName() + "§c (" + c.getArabicName() + ") مؤقتاً لامتلاء صندوقها وعدم توفر أداة سماد لتفريغ الفائض.");
-                    }
-                }
-                fullChestCrops.clear();
-                if (fullChestPausedFarms.containsAll(activeAreas.stream().map(FarmArea::getName).toList())) {
-                    sendChatMessage(client, "§c[Bot] تم إيقاف جميع المزارع مؤقتاً لامتلاء صناديقها وعدم توفر أداة سماد! إيقاف البوت لحين إفراغ الصناديق.");
-                    stop(client);
-                    return;
-                }
-            }
-            fullChestCrops.clear();
-            visitedDepositChests.clear();
-            targetDepositArea = null;
-            depositTimeoutTicks = 0;
-            currentStage = FarmStage.HARVEST;
+            handlePostDepositFullChests(client, player, level, activeAreas);
             return;
         }
 
@@ -2775,77 +2686,263 @@ public class FarmBotController {
             || item == net.minecraft.world.item.Items.NETHER_WART;
     }
 
+    private void handlePostDepositFullChests(
+            Minecraft client,
+            LocalPlayer player,
+            ClientLevel level,
+            List<FarmArea> activeAreas) {
+        if (!fullChestCrops.isEmpty() && hasAnyCompostableSurplus(player, fullChestCrops)) {
+            BlockPos composter = findNearbyComposter(player, level, 36);
+            if (composter != null) {
+                sendChatMessage(client, "§e[Bot] لم يجد مساحة في صندوق المورد! يتوجه الآن إلى أقرب كومبوستر لتحويل الفائض إلى سماد...");
+                targetComposterPos = composter;
+                currentStage = FarmStage.COMPOST;
+                compostTimeoutTicks = 0;
+                currentPath = null;
+                currentGoal = null;
+                visitedDepositChests.clear();
+                lastDepositTargetCrops.clear();
+                lastDepositExcludedCrops.clear();
+                lastDepositAllowUnmappedFarmItems = false;
+                targetDepositArea = null;
+                depositTimeoutTicks = 0;
+                cooldownTicks = 15;
+                return;
+            }
+            sendChatMessage(client, "§c[Bot] صناديق الموارد ممتلئة ولكن لم يتم العثور على أي كومبوستر قريب في المحيط (نطاق 36 بلوكة)!");
+        }
+
+        if (!fullChestCrops.isEmpty()) {
+            for (FarmArea area : activeAreas) {
+                Set<FarmCrop> areaCrops = getCropsInArea(level, area);
+                for (FarmCrop c : areaCrops) {
+                    if (fullChestCrops.contains(c)) {
+                        fullChestPausedFarms.add(area.getName());
+                        sendChatMessage(client, "§c[Bot] تم إيقاف العمل في مزرعة §e" + area.getName() + "§c (" + c.getArabicName() + ") مؤقتاً لامتلاء صندوقها وعدم توفر أداة سماد لتفريغ الفائض.");
+                        break;
+                    }
+                }
+            }
+            fullChestCrops.clear();
+
+            if (fullChestPausedFarms.containsAll(activeAreas.stream().map(FarmArea::getName).toList())) {
+                sendChatMessage(client, "§c[Bot] تم إيقاف جميع المزارع مؤقتاً لامتلاء صناديقها وعدم توفر أداة سماد! إيقاف البوت لحين إفراغ الصناديق.");
+                stop(client);
+                return;
+            }
+        }
+
+        fullChestCrops.clear();
+        visitedDepositChests.clear();
+        lastDepositTargetCrops.clear();
+        lastDepositExcludedCrops.clear();
+        lastDepositAllowUnmappedFarmItems = false;
+        targetDepositArea = null;
+        depositTimeoutTicks = 0;
+        currentStage = FarmStage.HARVEST;
+        cooldownTicks = 20;
+        sendChatMessage(client, "§a[Bot] اكتمل تفريغ كافة المحاصيل المحددة في الصناديق! استئناف دورة الزراعة...");
+    }
+
     /**
-     * تفريغ المحاصيل الفائضة في الصندوق المفتوح مع التأكد من وضع كل نوع في صندوقه الخاص
-     * مع الاحتفاظ بـ 64 حبة فقط من البذور لإعادة الزراعة
+     * جمع كافة أنواع المحاصيل المزروعة أو المخصصة في مزرعة معينة.
      */
-    private int depositSurplusIntoOpenChest(LocalPlayer player, MultiPlayerGameMode gameMode, FarmArea targetArea) {
-        var menu = player.containerMenu;
-        if (menu == null) return 0;
+    private Set<FarmCrop> getCropsInArea(ClientLevel level, FarmArea area) {
+        Set<FarmCrop> crops = EnumSet.noneOf(FarmCrop.class);
+        if (area == null) return crops;
 
-        FarmCrop areaCrop = getEffectiveCrop(targetArea);
+        if (area.getTargetCrop() != null) {
+            crops.add(area.getTargetCrop());
+            return crops;
+        }
 
-        // فحص محتويات الصندوق المفتوح
-        Set<net.minecraft.world.item.Item> chestExistingItems = new HashSet<>();
-        boolean chestIsEmpty = true;
-        for (int slotId = 0; slotId < menu.slots.size(); slotId++) {
-            var slot = menu.getSlot(slotId);
-            if (slot.container != player.getInventory()) {
-                ItemStack stack = slot.getItem();
-                if (!stack.isEmpty()) {
-                    chestIsEmpty = false;
-                    chestExistingItems.add(stack.getItem());
+        for (FarmCrop remembered : area.getRememberedCrops().values()) {
+            if (remembered != null) {
+                crops.add(remembered);
+            }
+        }
+
+        if (level != null) {
+            BlockPos min = area.getMinPos();
+            BlockPos max = area.getMaxPos();
+            for (int y = min.getY(); y <= max.getY(); y++) {
+                for (int x = min.getX(); x <= max.getX(); x++) {
+                    for (int z = min.getZ(); z <= max.getZ(); z++) {
+                        FarmCrop crop = FarmCrop.fromBlock(level.getBlockState(new BlockPos(x, y, z)).getBlock());
+                        if (crop != null) {
+                            crops.add(crop);
+                        }
+                    }
+                }
+            }
+        }
+        return crops;
+    }
+
+    /**
+     * جمع كل المحاصيل التي يعمل عليها البوت الآن في المزارع المفعلة.
+     */
+    private Set<FarmCrop> getActiveWorkingCrops(ClientLevel level, List<FarmArea> activeAreas) {
+        Set<FarmCrop> working = EnumSet.noneOf(FarmCrop.class);
+        if (activeAreas == null) return working;
+        for (FarmArea area : activeAreas) {
+            if (fullChestPausedFarms.contains(area.getName())) continue;
+            working.addAll(getCropsInArea(level, area));
+        }
+        return working;
+    }
+
+    private DepositPlan buildDepositPlan(
+            FarmArea targetArea,
+            List<FarmArea> activeAreas,
+            ClientLevel level,
+            Set<BlockPos> excludedChests) {
+        if (targetArea == null || targetArea.getChestPos() == null) {
+            return new DepositPlan(EnumSet.noneOf(FarmCrop.class), EnumSet.noneOf(FarmCrop.class), false);
+        }
+
+        BlockPos chestPos = targetArea.getChestPos();
+        Set<FarmCrop> cropsForChest = EnumSet.noneOf(FarmCrop.class);
+        boolean hasAutoAreaOnChest = false;
+
+        if (activeAreas != null) {
+            for (FarmArea area : activeAreas) {
+                if (fullChestPausedFarms.contains(area.getName())) continue;
+                if (chestPos.equals(area.getChestPos())) {
+                    cropsForChest.addAll(getCropsInArea(level, area));
+                    if (area.getTargetCrop() == null) {
+                        hasAutoAreaOnChest = true;
+                    }
                 }
             }
         }
 
-        int totalDeposited = 0;
-        Map<net.minecraft.world.item.Item, Integer> keptCountMap = new HashMap<>();
+        Set<FarmCrop> cropsWithOtherChests = EnumSet.noneOf(FarmCrop.class);
+        if (activeAreas != null) {
+            for (FarmArea area : activeAreas) {
+                if (fullChestPausedFarms.contains(area.getName())) continue;
+                BlockPos otherChest = area.getChestPos();
+                if (otherChest != null
+                        && !otherChest.equals(chestPos)
+                        && (excludedChests == null || !excludedChests.contains(otherChest))) {
+                    cropsWithOtherChests.addAll(getCropsInArea(level, area));
+                }
+            }
+        }
+
+        // إضافة كل المحاصيل التي يعمل عليها البوت الآن طالما لا تملك صندوقاً مستقلاً آخر غير مزور
+        for (FarmCrop workingCrop : getActiveWorkingCrops(level, activeAreas)) {
+            if (!cropsWithOtherChests.contains(workingCrop)) {
+                cropsForChest.add(workingCrop);
+            }
+        }
+
+        return new DepositPlan(cropsForChest, cropsWithOtherChests, hasAutoAreaOnChest);
+    }
+
+    private boolean shouldDepositItemWithPlan(Item item, DepositPlan plan) {
+        for (FarmCrop crop : plan.targetCrops()) {
+            if (doesItemBelongToCrop(item, crop)) {
+                return true;
+            }
+        }
+        if (plan.allowUnmappedFarmItems()) {
+            for (FarmCrop excludedCrop : plan.excludedCropsWithOtherChests()) {
+                if (doesItemBelongToCrop(item, excludedCrop)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * اختيار خانات البذور المحجوزة للاحتفاظ بـ 64 بذرة فقط دون ترك ستاكات متناثرة.
+     */
+    private Set<Integer> findSeedReserveSlotIds(LocalPlayer player, AbstractContainerMenu menu) {
+        Set<Integer> reserved = new HashSet<>();
+        Map<Item, List<Integer>> slotsBySeedItem = new HashMap<>();
 
         for (int slotId = 0; slotId < menu.slots.size(); slotId++) {
             var slot = menu.getSlot(slotId);
-            // البحث داخل خانات حقيبة اللاعب فقط
-            if (slot.container == player.getInventory()) {
-                ItemStack stack = slot.getItem();
-                if (stack.isEmpty()) continue;
-
-                net.minecraft.world.item.Item item = stack.getItem();
-                if (!isFarmDepositItem(item)) {
-                    continue; // ليس محصولاً أو غرضاً زراعياً
-                }
-
-                // قاعدة الفرز: وضع كل نوع في صندوقه المخصص دون خلط
-                boolean shouldDeposit = false;
-                if (areaCrop != null) {
-                    // المزرعة محدد لها نوع محصول: نضع في صندوقها فقط هذا المحصول ومنتجاته
-                    shouldDeposit = doesItemBelongToCrop(item, areaCrop);
-                } else {
-                    // إذا كانت المزرعة تلقائية: نضع فقط ما يتطابق مع ما في الصندوق مسبقاً
-                    if (chestExistingItems.contains(item)) {
-                        shouldDeposit = true;
-                    } else if (chestIsEmpty) {
-                        shouldDeposit = true;
-                        chestExistingItems.add(item);
-                    }
-                }
-
-                if (!shouldDeposit) {
-                    continue; // هذا المحصول لا ينتمي لهذا الصندوق إطلاقاً، نتركه لصندوقه المخصص!
-                }
-
-                if (isPlantedSeed(item)) {
-                    int keptSoFar = keptCountMap.getOrDefault(item, 0);
-                    if (keptSoFar < 64) {
-                        // الاحتفاظ بـ 64 بذرة لإعادة الزراعة
-                        keptCountMap.put(item, keptSoFar + stack.getCount());
-                        continue;
-                    }
-                }
-
-                // نقل الستاك بالكامل إلى الصندوق عبر Shift-Click (Quick Move)
-                gameMode.handleContainerInput(menu.containerId, slotId, 0, ContainerInput.QUICK_MOVE, player);
-                totalDeposited++;
+            if (slot.container != player.getInventory()) {
+                continue;
             }
+            ItemStack stack = slot.getItem();
+            if (stack.isEmpty() || !isPlantedSeed(stack.getItem())) {
+                continue;
+            }
+            slotsBySeedItem.computeIfAbsent(stack.getItem(), k -> new ArrayList<>()).add(slotId);
+        }
+
+        for (List<Integer> slotIds : slotsBySeedItem.values()) {
+            int fullStackSlot = -1;
+            for (int i = slotIds.size() - 1; i >= 0; i--) {
+                int slotId = slotIds.get(i);
+                ItemStack stack = menu.getSlot(slotId).getItem();
+                if (stack.getCount() >= stack.getMaxStackSize()) {
+                    fullStackSlot = slotId;
+                    break;
+                }
+            }
+            if (fullStackSlot != -1) {
+                reserved.add(fullStackSlot);
+                continue;
+            }
+
+            slotIds.sort(Comparator
+                .<Integer>comparingInt(id -> menu.getSlot(id).getItem().getCount())
+                .reversed()
+                .thenComparing(Comparator.<Integer>naturalOrder().reversed()));
+
+            int kept = 0;
+            for (int slotId : slotIds) {
+                int count = menu.getSlot(slotId).getItem().getCount();
+                if (kept == 0 || kept + count <= 64) {
+                    reserved.add(slotId);
+                    kept += count;
+                }
+            }
+        }
+        return reserved;
+    }
+
+    /**
+     * تفريغ المحاصيل الفائضة في الصندوق المفتوح لجميع المحاصيل العاملة المسموحة في هذا الصندوق
+     * مع الاحتفاظ بـ 64 حبة فقط من البذور لإعادة الزراعة.
+     */
+    private int depositSurplusIntoOpenChest(LocalPlayer player, MultiPlayerGameMode gameMode, DepositPlan plan) {
+        AbstractContainerMenu menu = player.containerMenu;
+        if (menu == null || plan == null) return 0;
+
+        Set<Integer> reservedSeedSlots = findSeedReserveSlotIds(player, menu);
+        int totalDeposited = 0;
+
+        for (int slotId = 0; slotId < menu.slots.size(); slotId++) {
+            var slot = menu.getSlot(slotId);
+            if (slot.container != player.getInventory()) {
+                continue;
+            }
+            ItemStack stack = slot.getItem();
+            if (stack.isEmpty()) continue;
+
+            Item item = stack.getItem();
+            if (!isFarmDepositItem(item)) {
+                continue; // ليس محصولاً أو غرضاً زراعياً
+            }
+
+            if (!shouldDepositItemWithPlan(item, plan)) {
+                continue; // ينتمي لصندوق مخصص آخر لم يُزر بعد في هذه الجولة
+            }
+
+            if (reservedSeedSlots.contains(slotId)) {
+                continue; // الاحتفاظ بـ 64 بذرة لإعادة الزراعة
+            }
+
+            // نقل الستاك بالكامل إلى الصندوق عبر Shift-Click (Quick Move)
+            gameMode.handleContainerInput(menu.containerId, slotId, 0, ContainerInput.QUICK_MOVE, player);
+            totalDeposited++;
         }
 
         return totalDeposited;
@@ -2889,7 +2986,7 @@ public class FarmBotController {
             ItemStack stack = inv.getItem(i);
             if (stack.isEmpty()) continue;
             Item item = stack.getItem();
-            if (item == Items.BAKED_POTATO) continue; // حماية طعام البوت دائماً
+            if (item == Items.BAKED_POTATO || BotFoodManager.getInstance().isAllowed(stack)) continue; // حماية طعام البوت دائماً
             if (!ComposterBlock.COMPOSTABLES.containsKey(item)) continue; // عنصر يقبله الكومبوستر
 
             // فحص هل العنصر ينتمي لأحد المحاصيل التي امتلأت صناديقها
@@ -3231,46 +3328,64 @@ public class FarmBotController {
         return true;
     }
 
-    private FarmArea findAreaNeedingDeposit(LocalPlayer player, List<FarmArea> areas, Set<BlockPos> excludedChests) {
+    private FarmArea findAreaNeedingDeposit(LocalPlayer player, ClientLevel level, List<FarmArea> areas, Set<BlockPos> excludedChests) {
         if (areas == null || areas.isEmpty() || player == null) return null;
 
-        // 1. أولاً: فحص المزرعة الحالية إذا كان لها صندوق ولم نزره بعد ولدينا فائض من محصولها المخصص
+        // 1. فحص المزرعة الحالية أولاً إذا كان لها صندوق غير مزور وفيه فائض من المحاصيل التي يقبلها هذا الصندوق
         if (currentAreaIndex < areas.size()) {
             FarmArea current = areas.get(currentAreaIndex);
-            if (current.getChestPos() != null && !fullChestPausedFarms.contains(current.getName()) && (excludedChests == null || !excludedChests.contains(current.getChestPos()))) {
-                FarmCrop crop = getEffectiveCrop(current);
-                if (crop != null && hasCropSurplus(player, crop)) {
-                    return current;
-                }
+            if (canAreaAcceptDeposit(player, level, current, areas, excludedChests)) {
+                return current;
             }
         }
 
-        // 2. ثانياً: فحص أي مزرعة أخرى لها صندوق مسجل ويتوفر مع اللاعب فائض من نوع محصولها
+        // 2. فحص بقية المزارع المفعلة المرتبطة بصناديق متاحة لأي محصول يعمل عليه البوت الآن
         for (FarmArea area : areas) {
-            if (area.getChestPos() != null && !fullChestPausedFarms.contains(area.getName()) && (excludedChests == null || !excludedChests.contains(area.getChestPos()))) {
-                FarmCrop crop = getEffectiveCrop(area);
-                if (crop != null && hasCropSurplus(player, crop)) {
-                    return area;
-                }
-            }
-        }
-
-        // 3. ثالثاً: إذا كان هناك فائض غير مخصص ولدينا مزارع بصناديق تلقائية
-        for (FarmArea area : areas) {
-            if (area.getChestPos() != null && !fullChestPausedFarms.contains(area.getName()) && (excludedChests == null || !excludedChests.contains(area.getChestPos()))) {
-                FarmCrop crop = getEffectiveCrop(area);
-                if (crop == null && hasAnyFarmSurplus(player)) {
-                    return area;
-                }
+            if (canAreaAcceptDeposit(player, level, area, areas, excludedChests)) {
+                return area;
             }
         }
 
         return null;
     }
 
-    private FarmArea findAreaNeedingDeposit(LocalPlayer player, List<FarmArea> areas) {
-        return findAreaNeedingDeposit(player, areas, visitedDepositChests);
+    private FarmArea findAreaNeedingDeposit(LocalPlayer player, ClientLevel level, List<FarmArea> areas) {
+        return findAreaNeedingDeposit(player, level, areas, visitedDepositChests);
     }
+
+    private boolean canAreaAcceptDeposit(
+            LocalPlayer player,
+            ClientLevel level,
+            FarmArea area,
+            List<FarmArea> activeAreas,
+            Set<BlockPos> excludedChests) {
+        if (area == null || area.getChestPos() == null || fullChestPausedFarms.contains(area.getName())) {
+            return false;
+        }
+        if (excludedChests != null && excludedChests.contains(area.getChestPos())) {
+            return false;
+        }
+
+        DepositPlan plan = buildDepositPlan(area, activeAreas, level, excludedChests);
+        for (FarmCrop crop : plan.targetCrops()) {
+            if (hasCropSurplus(player, crop)) {
+                return true;
+            }
+        }
+        if (plan.allowUnmappedFarmItems()) {
+            for (FarmCrop crop : FarmCrop.values()) {
+                if (!plan.excludedCropsWithOtherChests().contains(crop) && hasCropSurplus(player, crop)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private record DepositPlan(
+            Set<FarmCrop> targetCrops,
+            Set<FarmCrop> excludedCropsWithOtherChests,
+            boolean allowUnmappedFarmItems) {}
 
     private boolean hasCropSurplus(LocalPlayer player, FarmCrop crop) {
         if (crop == null || player == null) return false;
@@ -3284,18 +3399,6 @@ public class FarmBotController {
             case CARROT -> countItemInInventory(player, net.minecraft.world.item.Items.CARROT) > 64;
             case NETHER_WART -> countItemInInventory(player, net.minecraft.world.item.Items.NETHER_WART) > 64;
         };
-    }
-
-    private boolean hasAnyFarmSurplus(LocalPlayer player) {
-        if (countItemInInventory(player, net.minecraft.world.item.Items.WHEAT) > 0) return true;
-        if (countItemInInventory(player, net.minecraft.world.item.Items.BEETROOT) > 0) return true;
-        if (countItemInInventory(player, net.minecraft.world.item.Items.POISONOUS_POTATO) > 0) return true;
-        if (countItemInInventory(player, net.minecraft.world.item.Items.WHEAT_SEEDS) > 64) return true;
-        if (countItemInInventory(player, net.minecraft.world.item.Items.BEETROOT_SEEDS) > 64) return true;
-        if (countItemInInventory(player, net.minecraft.world.item.Items.CARROT) > 64) return true;
-        if (countItemInInventory(player, net.minecraft.world.item.Items.POTATO) > 64) return true;
-        if (countItemInInventory(player, net.minecraft.world.item.Items.NETHER_WART) > 64) return true;
-        return false;
     }
 
     private int countItemInInventory(LocalPlayer player, net.minecraft.world.item.Item item) {

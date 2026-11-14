@@ -7,8 +7,12 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.helpermod.HelperMod;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
@@ -44,6 +48,7 @@ public class BotFoodManager {
     public static final Map<String, String> FOOD_NAMES = new LinkedHashMap<>();
     static {
         FOOD_NAMES.put("cooked_beef", "ستيك / لحم بقر مطبوخ");
+        FOOD_NAMES.put("cooked_porkchop", "لحم خنزير مطبوخ");
         FOOD_NAMES.put("cooked_mutton", "لحم غنم مطبوخ");
         FOOD_NAMES.put("cooked_chicken", "دجاج مطبوخ");
         FOOD_NAMES.put("cooked_salmon", "سلمون مطبوخ");
@@ -80,14 +85,117 @@ public class BotFoodManager {
         return INSTANCE;
     }
 
-    public synchronized boolean addFood(String rawName) {
-        if (rawName == null || rawName.isBlank()) return false;
+    public enum AddFoodResult {
+        ADDED,
+        ALREADY_EXISTS,
+        INVALID
+    }
+
+    public synchronized AddFoodResult addFoodChecked(String rawName) {
+        if (rawName == null || rawName.isBlank()) return AddFoodResult.INVALID;
         String normalized = normalizeFoodName(rawName);
+        if (!isValidFoodName(normalized)) {
+            return AddFoodResult.INVALID;
+        }
         boolean added = allowedFoods.add(normalized);
         if (added) {
             save();
+            return AddFoodResult.ADDED;
         }
-        return added;
+        return AddFoodResult.ALREADY_EXISTS;
+    }
+
+    public synchronized boolean addFood(String rawName) {
+        return addFoodChecked(rawName) == AddFoodResult.ADDED;
+    }
+
+    /**
+     * التحقق من أن الاسم يطابق طعاماً فعلياً مسجلاً في اللعبة.
+     */
+    public static boolean isValidFoodName(String rawName) {
+        if (rawName == null || rawName.isBlank()) return false;
+        String normalized = normalizeFoodName(rawName);
+        if (normalized.isBlank() || normalized.contains(" ")) return false;
+        if (FOOD_NAMES.containsKey(normalized)) return true;
+
+        Identifier id = normalized.contains(":")
+            ? Identifier.tryParse(normalized)
+            : Identifier.tryParse("minecraft:" + normalized);
+        if (id == null || !BuiltInRegistries.ITEM.containsKey(id)) {
+            return false;
+        }
+        Item item = BuiltInRegistries.ITEM.getValue(id);
+        return item != null && item != Items.AIR && item.components().has(DataComponents.FOOD);
+    }
+
+    /**
+     * التحقق من وجود أي طعام مسموح وصالح للأكل حالياً في حقيبة اللاعب.
+     */
+    public synchronized boolean hasEdibleAllowedFood(LocalPlayer player) {
+        if (player == null) return false;
+        for (int i = 0; i < 36; i++) {
+            if (canEatNow(player, player.getInventory().getItem(i))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * العثور على أفضل طعام مسموح وصالح للأكل في الهوتبار أو نقله من الحقيبة إلى خانة محددة.
+     */
+    public synchronized int ensureBestFoodInHotbar(
+            LocalPlayer player,
+            MultiPlayerGameMode gameMode,
+            int fallbackHotbarSlot,
+            int avoidHotbarSlot) {
+        if (player == null) return -1;
+
+        int bestHotbarSlot = -1;
+        int bestHotbarScore = -1;
+        for (int i = 0; i < 9; i++) {
+            if (i == avoidHotbarSlot) continue;
+            ItemStack stack = player.getInventory().getItem(i);
+            if (canEatNow(player, stack)) {
+                int score = getFoodScore(stack);
+                if (score > bestHotbarScore) {
+                    bestHotbarScore = score;
+                    bestHotbarSlot = i;
+                }
+            }
+        }
+        if (bestHotbarSlot != -1) {
+            return bestHotbarSlot;
+        }
+
+        if (gameMode != null) {
+            int invBestSlot = -1;
+            int invBestScore = -1;
+            for (int i = 9; i < 36; i++) {
+                ItemStack stack = player.getInventory().getItem(i);
+                if (canEatNow(player, stack)) {
+                    int score = getFoodScore(stack);
+                    if (score > invBestScore) {
+                        invBestScore = score;
+                        invBestSlot = i;
+                    }
+                }
+            }
+            if (invBestSlot != -1) {
+                int containerId = player.inventoryMenu.containerId;
+                gameMode.handleContainerInput(containerId, invBestSlot, fallbackHotbarSlot, ContainerInput.SWAP, player);
+                return fallbackHotbarSlot;
+            }
+        }
+
+        if (avoidHotbarSlot >= 0 && avoidHotbarSlot < 9) {
+            ItemStack avoided = player.getInventory().getItem(avoidHotbarSlot);
+            if (canEatNow(player, avoided)) {
+                return avoidHotbarSlot;
+            }
+        }
+
+        return -1;
     }
 
     public synchronized boolean removeFood(String rawName) {

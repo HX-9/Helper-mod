@@ -18,8 +18,8 @@ import net.minecraft.world.entity.projectile.Projectile;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.core.BlockPos;
 import net.minecraft.tags.ItemTags;
-import net.minecraft.world.item.AxeItem;
 import net.minecraft.world.item.HoeItem;
+
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
@@ -124,8 +124,16 @@ public class FightBotController {
         return isRetreating;
     }
 
+    /**
+     * تطبيق نمط الدفاع المحفوظ عند تشغيل العميل دون إعادة كتابة ملف الإعدادات.
+     */
+    public void applyPersistedDefenseMode(DefenseMode mode) {
+        this.defenseMode = mode != null ? mode : DefenseMode.CAUTIOUS;
+    }
+
     public void setDefenseMode(Minecraft client, DefenseMode mode) {
         this.defenseMode = mode;
+        BotSettingsManager.getInstance().setDefenseMode(mode);
         if (mode == DefenseMode.OFF) {
             disableDefenseCompletely(client);
             sendChatMessage(client, "§c[Bot] تم إيقاف وضع الدفاع بالكامل في المطلق (/bot defend off).");
@@ -637,102 +645,15 @@ public class FightBotController {
      * إذا كان في شريط الأدوات أو الحقيبة، يتم نقله تلقائياً إلى اليد اليسرى.
      */
     public boolean ensureShieldInOffhand(Minecraft client, LocalPlayer player, MultiPlayerGameMode gameMode) {
-        if (player.getOffhandItem().is(Items.SHIELD)) {
-            return true;
-        }
-
-        int containerId = player.inventoryMenu.containerId;
-
-        // 1. البحث في شريط الأدوات (Hotbar: الخانات 0 إلى 8)
-        for (int i = 0; i < 9; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.is(Items.SHIELD)) {
-                int containerSlot = 36 + i;
-                gameMode.handleContainerInput(containerId, containerSlot, 40, ContainerInput.SWAP, player);
-                return true;
-            }
-        }
-
-        // 2. البحث في الحقيبة الرئيسية (الخانات 9 إلى 35)
-        for (int i = 9; i < 36; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.is(Items.SHIELD)) {
-                gameMode.handleContainerInput(containerId, i, 40, ContainerInput.SWAP, player);
-                return true;
-            }
-        }
-
-        return false;
+        return BotEquipmentHelper.ensureInOffhand(player, gameMode, stack -> stack.is(Items.SHIELD));
     }
 
     public static int getAxeTier(ItemStack stack) {
-        if (stack == null || stack.isEmpty()) return -1;
-        if (stack.getItem() instanceof AxeItem) {
-            if (stack.is(Items.NETHERITE_AXE)) return 7;
-            if (stack.is(Items.DIAMOND_AXE)) return 6;
-            if (stack.is(Items.IRON_AXE)) return 5;
-            if (stack.is(Items.STONE_AXE)) return 4;
-            if (stack.is(Items.GOLDEN_AXE)) return 3;
-            if (stack.is(Items.WOODEN_AXE)) return 2;
-            return 2;
-        }
-        if (stack.is(ItemTags.SWORDS)) {
-            if (stack.is(Items.NETHERITE_SWORD)) return 6;
-            if (stack.is(Items.DIAMOND_SWORD)) return 5;
-            if (stack.is(Items.IRON_SWORD)) return 4;
-            if (stack.is(Items.STONE_SWORD)) return 3;
-            if (stack.is(Items.GOLDEN_SWORD)) return 2;
-            if (stack.is(Items.WOODEN_SWORD)) return 1;
-            return 1;
-        }
-        return -1;
+        return BotEquipmentHelper.getAxeOrSwordTier(stack);
     }
 
     public boolean ensureBestAxeInMainHand(LocalPlayer player, MultiPlayerGameMode gameMode) {
-        ItemStack current = player.getMainHandItem();
-        int bestSlot = -1;
-        int bestTier = getAxeTier(current);
-
-        for (int i = 0; i < 9; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            int tier = getAxeTier(stack);
-            if (tier > bestTier) {
-                bestTier = tier;
-                bestSlot = i;
-            }
-        }
-
-        if (bestSlot != -1) {
-            player.getInventory().setSelectedSlot(bestSlot);
-            if (player.connection != null) {
-                player.connection.send(new ServerboundSetCarriedItemPacket(bestSlot));
-            }
-            return true;
-        }
-
-        if (bestTier > 0) return true;
-
-        int invBestSlot = -1;
-        for (int i = 9; i < 36; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            int tier = getAxeTier(stack);
-            if (tier > bestTier) {
-                bestTier = tier;
-                invBestSlot = i;
-            }
-        }
-
-        if (invBestSlot != -1) {
-            int targetHotbar = 0;
-            int containerId = player.inventoryMenu.containerId;
-            gameMode.handleContainerInput(containerId, invBestSlot, targetHotbar, ContainerInput.SWAP, player);
-            player.getInventory().setSelectedSlot(targetHotbar);
-            if (player.connection != null) {
-                player.connection.send(new ServerboundSetCarriedItemPacket(targetHotbar));
-            }
-            return true;
-        }
-        return false;
+        return BotEquipmentHelper.ensureBestInMainHand(player, gameMode, BotEquipmentHelper::getAxeOrSwordTier, 1, 0);
     }
 
     /**
@@ -740,50 +661,15 @@ public class FightBotController {
      * إذا لم يكن في اليد اليسرى، يتم البحث عنه في شريط الأدوات أو الحقيبة وتبديله فوراً مع ما في اليد اليسرى.
      */
     public boolean ensureHoeInOffhand(Minecraft client, LocalPlayer player, MultiPlayerGameMode gameMode) {
-        if (player.getOffhandItem().getItem() instanceof HoeItem) {
-            return true;
-        }
-
-        int containerId = player.inventoryMenu.containerId;
-
-        // 1. البحث في شريط الأدوات (Hotbar: الخانات 0 إلى 8)
-        for (int i = 0; i < 9; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.getItem() instanceof HoeItem) {
-                int containerSlot = 36 + i;
-                gameMode.handleContainerInput(containerId, containerSlot, 40, ContainerInput.SWAP, player);
-                return true;
-            }
-        }
-
-        // 2. البحث في الحقيبة الرئيسية (الخانات 9 إلى 35)
-        for (int i = 9; i < 36; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.getItem() instanceof HoeItem) {
-                gameMode.handleContainerInput(containerId, i, 40, ContainerInput.SWAP, player);
-                return true;
-            }
-        }
-
-        return false;
+        return BotEquipmentHelper.ensureInOffhand(player, gameMode, stack -> stack.getItem() instanceof HoeItem);
     }
 
     public boolean hasShieldInInventory(LocalPlayer player) {
-        if (player.getOffhandItem().is(Items.SHIELD)) return true;
-        for (int i = 0; i < 36; i++) {
-            ItemStack s = player.getInventory().getItem(i);
-            if (!s.isEmpty() && s.is(Items.SHIELD)) return true;
-        }
-        return false;
+        return BotEquipmentHelper.hasMatchingItem(player, stack -> stack.is(Items.SHIELD), true);
     }
 
     public boolean hasHoeInInventory(LocalPlayer player) {
-        if (player.getOffhandItem().getItem() instanceof HoeItem) return true;
-        for (int i = 0; i < 36; i++) {
-            ItemStack s = player.getInventory().getItem(i);
-            if (!s.isEmpty() && s.getItem() instanceof HoeItem) return true;
-        }
-        return false;
+        return BotEquipmentHelper.hasMatchingItem(player, stack -> stack.getItem() instanceof HoeItem, true);
     }
 
     /**
@@ -985,25 +871,8 @@ public class FightBotController {
         if (!player.getCooldowns().isOnCooldown(new ItemStack(Items.SHIELD))) return;
 
         shieldSwapCooldown = 100; // منع التكرار والسبام لمدة 5 ثوانٍ كاملة
-        int containerId = player.inventoryMenu.containerId;
-
-        // البحث في الحقيبة الرئيسية عن درع آخر
-        for (int i = 9; i < 36; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.is(Items.SHIELD)) {
-                gameMode.handleContainerInput(containerId, i, 40, ContainerInput.SWAP, player);
-                sendChatMessage(client, "§e[Bot - Defend] الدرع تعطل بضربة فأس! تم استبداله بدرع احتياطي فوراً.");
-                return;
-            }
-        }
-        // البحث في شريط الأدوات
-        for (int i = 0; i < 9; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.is(Items.SHIELD)) {
-                gameMode.handleContainerInput(containerId, 36 + i, 40, ContainerInput.SWAP, player);
-                sendChatMessage(client, "§e[Bot - Defend] الدرع تعطل بضربة فأس! تم استبداله بدرع احتياطي فوراً.");
-                return;
-            }
+        if (BotEquipmentHelper.swapBackupShieldToOffhand(player, gameMode, false, false)) {
+            sendChatMessage(client, "§e[Bot - Defend] الدرع تعطل بضربة فأس! تم استبداله بدرع احتياطي فوراً.");
         }
     }
 
@@ -1318,10 +1187,7 @@ public class FightBotController {
     }
 
     public static float wrapDegrees(float degrees) {
-        float f = degrees % 360.0f;
-        if (f >= 180.0f) f -= 360.0f;
-        if (f < -180.0f) f += 360.0f;
-        return f;
+        return BotEquipmentHelper.wrapDegrees(degrees);
     }
 
     /**

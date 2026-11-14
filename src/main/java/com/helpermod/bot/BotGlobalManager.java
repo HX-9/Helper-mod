@@ -26,8 +26,16 @@ public class BotGlobalManager {
         return botEnabled;
     }
 
+    /**
+     * تطبيق حالة التفعيل المحفوظة عند تشغيل العميل دون إعادة كتابة ملف الإعدادات.
+     */
+    public void applyPersistedEnabled(boolean enabled) {
+        this.botEnabled = enabled;
+    }
+
     public void setBotEnabled(Minecraft client, boolean enabled) {
         this.botEnabled = enabled;
+        BotSettingsManager.getInstance().setBotEnabled(enabled);
         if (!enabled) {
             stopAll(client);
             sendMessage(client, "§c[Bot] تم إيقاف عمل البوت والمود بالكامل (Bot Mode: OFF). تم إيقاف جميع الأنشطة التلقائية وتحرير التحكم بالكامل.");

@@ -1,5 +1,6 @@
 package com.helpermod.bot.combat;
 
+import com.helpermod.bot.BotEquipmentHelper;
 import com.helpermod.bot.BotFollowController;
 import com.helpermod.bot.friend.BotFriendManager;
 import net.minecraft.client.Minecraft;
@@ -30,6 +31,7 @@ import java.util.*;
  * - يفضل السيف عند وجود أكثر من عدوين في نفس الجهة لضربة Sweeping شاملة وبدون قفز إطلاقاً
  * - نظام تثبيت الهدف (Target Lock) لمنع التوهان بين الأعداء الكثر
  */
+@SuppressWarnings("unused")
 public class BotCombatManager {
     private static final BotCombatManager INSTANCE = new BotCombatManager();
 
@@ -775,154 +777,31 @@ public class BotCombatManager {
     // إدارة الأسلحة والدروع (Weapon & Armor Management)
     // ==========================================
     public static int getSwordTier(ItemStack stack) {
-        if (stack == null || stack.isEmpty()) return 0;
-        if (stack.is(Items.NETHERITE_SWORD)) return 6;
-        if (stack.is(Items.DIAMOND_SWORD)) return 5;
-        if (stack.is(Items.IRON_SWORD)) return 4;
-        if (stack.is(Items.STONE_SWORD)) return 3;
-        if (stack.is(Items.GOLDEN_SWORD)) return 2;
-        if (stack.is(Items.WOODEN_SWORD)) return 1;
-        return 0;
+        return BotEquipmentHelper.getSwordTier(stack);
     }
 
     public static int getAxeTier(ItemStack stack) {
-        if (stack == null || stack.isEmpty()) return 0;
-        if (stack.is(Items.NETHERITE_AXE)) return 6;
-        if (stack.is(Items.DIAMOND_AXE)) return 5;
-        if (stack.is(Items.IRON_AXE)) return 4;
-        if (stack.is(Items.STONE_AXE)) return 3;
-        if (stack.is(Items.GOLDEN_AXE)) return 2;
-        if (stack.is(Items.WOODEN_AXE)) return 1;
-        return 0;
+        return BotEquipmentHelper.getAxeTier(stack);
     }
 
     public static boolean hasSword(LocalPlayer player) {
-        if (getSwordTier(player.getMainHandItem()) > 0) return true;
-        for (int i = 0; i < 36; i++) {
-            if (getSwordTier(player.getInventory().getItem(i)) > 0) return true;
-        }
-        return false;
+        return BotEquipmentHelper.hasMatchingItem(player, stack -> getSwordTier(stack) > 0, false);
     }
 
     public static boolean hasAxe(LocalPlayer player) {
-        if (getAxeTier(player.getMainHandItem()) > 0) return true;
-        for (int i = 0; i < 36; i++) {
-            if (getAxeTier(player.getInventory().getItem(i)) > 0) return true;
-        }
-        return false;
+        return BotEquipmentHelper.hasMatchingItem(player, stack -> getAxeTier(stack) > 0, false);
     }
 
     public boolean ensureBestSwordInMainHand(LocalPlayer player, MultiPlayerGameMode gameMode) {
-        ItemStack current = player.getMainHandItem();
-        int bestSlot = -1;
-        int bestTier = getSwordTier(current);
-
-        for (int i = 0; i < 9; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            int tier = getSwordTier(stack);
-            if (tier > bestTier) {
-                bestTier = tier;
-                bestSlot = i;
-            }
-        }
-
-        if (bestSlot != -1) {
-            player.getInventory().setSelectedSlot(bestSlot);
-            if (player.connection != null) {
-                player.connection.send(new ServerboundSetCarriedItemPacket(bestSlot));
-            }
-            return true;
-        }
-        if (bestTier > 0) return true;
-
-        // فحص الحقيبة (9-35)
-        int invBestSlot = -1;
-        for (int i = 9; i < 36; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            int tier = getSwordTier(stack);
-            if (tier > bestTier) {
-                bestTier = tier;
-                invBestSlot = i;
-            }
-        }
-
-        if (invBestSlot != -1) {
-            int targetHotbar = 0;
-            int containerId = player.inventoryMenu.containerId;
-            gameMode.handleContainerInput(containerId, invBestSlot, targetHotbar, ContainerInput.SWAP, player);
-            player.getInventory().setSelectedSlot(targetHotbar);
-            if (player.connection != null) {
-                player.connection.send(new ServerboundSetCarriedItemPacket(targetHotbar));
-            }
-            return true;
-        }
-        return false;
+        return BotEquipmentHelper.ensureBestInMainHand(player, gameMode, BotEquipmentHelper::getSwordTier, 1, 0);
     }
 
     public boolean ensureBestAxeInMainHand(LocalPlayer player, MultiPlayerGameMode gameMode) {
-        ItemStack current = player.getMainHandItem();
-        int bestSlot = -1;
-        int bestTier = getAxeTier(current);
-
-        for (int i = 0; i < 9; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            int tier = getAxeTier(stack);
-            if (tier > bestTier) {
-                bestTier = tier;
-                bestSlot = i;
-            }
-        }
-
-        if (bestSlot != -1) {
-            player.getInventory().setSelectedSlot(bestSlot);
-            if (player.connection != null) {
-                player.connection.send(new ServerboundSetCarriedItemPacket(bestSlot));
-            }
-            return true;
-        }
-        if (bestTier > 0) return true;
-
-        int invBestSlot = -1;
-        for (int i = 9; i < 36; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            int tier = getAxeTier(stack);
-            if (tier > bestTier) {
-                bestTier = tier;
-                invBestSlot = i;
-            }
-        }
-
-        if (invBestSlot != -1) {
-            int targetHotbar = 0;
-            int containerId = player.inventoryMenu.containerId;
-            gameMode.handleContainerInput(containerId, invBestSlot, targetHotbar, ContainerInput.SWAP, player);
-            player.getInventory().setSelectedSlot(targetHotbar);
-            if (player.connection != null) {
-                player.connection.send(new ServerboundSetCarriedItemPacket(targetHotbar));
-            }
-            return true;
-        }
-        return false;
+        return BotEquipmentHelper.ensureBestInMainHand(player, gameMode, BotEquipmentHelper::getAxeTier, 1, 0);
     }
 
     public void ensureShieldInOffhand(LocalPlayer player, MultiPlayerGameMode gameMode) {
-        if (player.getOffhandItem().is(Items.SHIELD)) return;
-
-        int containerId = player.inventoryMenu.containerId;
-        for (int i = 0; i < 9; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.is(Items.SHIELD)) {
-                gameMode.handleContainerInput(containerId, 36 + i, 40, ContainerInput.SWAP, player);
-                return;
-            }
-        }
-        for (int i = 9; i < 36; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.is(Items.SHIELD)) {
-                gameMode.handleContainerInput(containerId, i, 40, ContainerInput.SWAP, player);
-                return;
-            }
-        }
+        BotEquipmentHelper.ensureInOffhand(player, gameMode, stack -> stack.is(Items.SHIELD));
     }
 
     public void checkShieldDisabledAndSwap(Minecraft client, LocalPlayer player, MultiPlayerGameMode gameMode) {
@@ -932,22 +811,7 @@ public class BotCombatManager {
         if (!shieldDisabled) return;
 
         shieldSwapCooldown = 20;
-        int containerId = player.inventoryMenu.containerId;
-
-        for (int i = 0; i < 9; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.is(Items.SHIELD) && !player.getCooldowns().isOnCooldown(stack)) {
-                gameMode.handleContainerInput(containerId, 36 + i, 40, ContainerInput.SWAP, player);
-                return;
-            }
-        }
-        for (int i = 9; i < 36; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.is(Items.SHIELD) && !player.getCooldowns().isOnCooldown(stack)) {
-                gameMode.handleContainerInput(containerId, i, 40, ContainerInput.SWAP, player);
-                return;
-            }
-        }
+        BotEquipmentHelper.swapBackupShieldToOffhand(player, gameMode, true, true);
     }
 
     private LivingEntity findLivingEntityByUUID(ClientLevel level, LocalPlayer player, UUID uuid) {
@@ -1017,9 +881,6 @@ public class BotCombatManager {
     }
 
     public static float wrapDegrees(float degrees) {
-        float f = degrees % 360.0f;
-        if (f >= 180.0f) f -= 360.0f;
-        if (f < -180.0f) f += 360.0f;
-        return f;
+        return BotEquipmentHelper.wrapDegrees(degrees);
     }
 }

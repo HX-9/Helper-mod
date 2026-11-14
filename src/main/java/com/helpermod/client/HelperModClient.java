@@ -21,9 +21,14 @@ import net.minecraft.world.level.block.state.BlockState;
 public class HelperModClient implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
-        // تحميل إعدادات المزارع والأصدقاء المحفوظة
+        // تحميل إعدادات المزارع والأصدقاء والأطعمة والإعدادات العامة المحفوظة
         FarmAreaManager.getInstance().load();
         com.helpermod.bot.friend.BotFriendManager.getInstance().load();
+        com.helpermod.bot.food.BotFoodManager.getInstance().load();
+        com.helpermod.bot.BotSettingsManager settings = com.helpermod.bot.BotSettingsManager.getInstance();
+        settings.load();
+        com.helpermod.bot.BotGlobalManager.getInstance().applyPersistedEnabled(settings.isBotEnabled());
+        com.helpermod.bot.FightBotController.getInstance().applyPersistedDefenseMode(settings.getDefenseMode());
 
         // تسجيل أوامر البوت في الكلاينت
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {

@@ -13,23 +13,18 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.player.Player;
-import net.minecraft.world.entity.projectile.Projectile;
 import net.minecraft.world.inventory.ContainerInput;
-import net.minecraft.world.item.AxeItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.DoorBlock;
 import net.minecraft.world.level.block.FenceGateBlock;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -79,39 +74,13 @@ public class BotFollowController {
     private int companionStationaryTicks = 0;
     private int doorInteractCooldown = 0;
 
-    // نظام الحارس الشخصي ورصد الأعداء (Tactical Bodyguard & Aggro System)
-    private final Map<UUID, Integer> hostileTargets = new HashMap<>();
-    private UUID currentTargetUUID = null;
-    private boolean isJumpingForCrit = false;
-    private int jumpCritTicks = 0;
-    private int tetherAlertCooldown = 0;
-    @SuppressWarnings("unused")
-    private int arrowDefenseCooldown = 0;
-    @SuppressWarnings("unused")
-    private int eatingTicks = 0;
-    @SuppressWarnings("unused")
-    private boolean isEatingInCombat = false;
     // الأولوية رقم 1: نظام الأكل والعلاج الذاتي التلقائي أثناء الاتباع
     private boolean isEatingWhileFollowing = false;
     private int followEatingTicks = 0;
     private int lastFollowFoodLevel = -1;
-    private int shieldSwapCooldown = 0;
     private int hungryAlertCooldown = 0;
     private int moveJumpCooldown = 0;
     private int followEatSuppressionTicks = 0;
-
-    // تكتيك قتال الكريبر (Hit & Run 10 Blocks with Sprint-Jump)
-    private enum CreeperTacticState {
-        NONE,
-        APPROACH_AND_STRIKE,
-        FLEE_SPRINT_JUMP,
-        ASSESS
-    }
-    private CreeperTacticState creeperState = CreeperTacticState.NONE;
-    private Vec3 creeperFleeStartPos = null;
-    private Vec3 creeperFleeDir = null;
-    private int creeperFleeTicks = 0;
-    private int creeperAssessTicks = 0;
 
     private BotFollowController() {}
 
@@ -163,26 +132,12 @@ public class BotFollowController {
         this.strafeTicks = 0;
         this.lastStuckCheckPos = null;
         this.companionStationaryTicks = 0;
-        this.hostileTargets.clear();
-        this.currentTargetUUID = null;
-        this.isJumpingForCrit = false;
-        this.jumpCritTicks = 0;
-        this.tetherAlertCooldown = 0;
-        this.arrowDefenseCooldown = 0;
-        this.eatingTicks = 0;
-        this.isEatingInCombat = false;
         this.isEatingWhileFollowing = false;
         this.followEatingTicks = 0;
         this.lastFollowFoodLevel = -1;
-        this.shieldSwapCooldown = 0;
         this.hungryAlertCooldown = 0;
         this.moveJumpCooldown = 0;
         this.followEatSuppressionTicks = 0;
-        this.creeperState = CreeperTacticState.NONE;
-        this.creeperFleeStartPos = null;
-        this.creeperFleeDir = null;
-        this.creeperFleeTicks = 0;
-        this.creeperAssessTicks = 0;
 
         // تصفير أي قتال أو دفاع معلق في الكنترولر القتالي
         BotCombatManager.getInstance().resetCombat(client);
@@ -202,6 +157,9 @@ public class BotFollowController {
 
         if (client != null && client.player != null) {
             client.player.sendSystemMessage(Component.literal("§a[Bot] تم تفعيل وضع الاتباع الذكي والحارس الشخصي للاعب: §e" + playerName + "§a!"));
+            if (!BotGlobalManager.getInstance().isBotEnabled()) {
+                client.player.sendSystemMessage(Component.literal("§e[Bot] تنبيه: الوضع العام للمود متوقف حالياً (/bot mode off). فعّله عبر: §b/bot mode on"));
+            }
         }
     }
 
@@ -218,26 +176,12 @@ public class BotFollowController {
         this.lastGoalPos = null;
         this.stuckTicks = 0;
         this.strafeTicks = 0;
-        this.hostileTargets.clear();
-        this.currentTargetUUID = null;
-        this.isJumpingForCrit = false;
-        this.jumpCritTicks = 0;
-        this.tetherAlertCooldown = 0;
-        this.arrowDefenseCooldown = 0;
-        this.eatingTicks = 0;
-        this.isEatingInCombat = false;
         this.isEatingWhileFollowing = false;
         this.followEatingTicks = 0;
         this.lastFollowFoodLevel = -1;
-        this.shieldSwapCooldown = 0;
         this.hungryAlertCooldown = 0;
         this.moveJumpCooldown = 0;
         this.followEatSuppressionTicks = 0;
-        this.creeperState = CreeperTacticState.NONE;
-        this.creeperFleeStartPos = null;
-        this.creeperFleeDir = null;
-        this.creeperFleeTicks = 0;
-        this.creeperAssessTicks = 0;
 
         BotCombatManager.getInstance().resetCombat(client);
         releaseMovement(client);
@@ -281,14 +225,13 @@ public class BotFollowController {
         }
         this.targetPlayerUUID = companion.getUUID();
 
-        if (tetherAlertCooldown > 0) tetherAlertCooldown--;
         if (hungryAlertCooldown > 0) hungryAlertCooldown--;
         if (moveJumpCooldown > 0) moveJumpCooldown--;
         if (followEatSuppressionTicks > 0) followEatSuppressionTicks--;
 
         // تحرير القفز التلقائي فوراً بمجرد الارتفاع عن الأرض في الهواء لمنع تكرار القفز العشوائي
         boolean inWater = player.isInWater() || level.getBlockState(player.blockPosition()).is(Blocks.WATER);
-        if (!player.onGround() && !inWater && !isJumpingForCrit) {
+        if (!player.onGround() && !inWater) {
             client.options.keyJump.setDown(false);
         }
 
@@ -832,10 +775,7 @@ public class BotFollowController {
     }
 
     private static float wrapDegrees(float degrees) {
-        float f = degrees % 360.0f;
-        if (f >= 180.0f) f -= 360.0f;
-        if (f < -180.0f) f += 360.0f;
-        return f;
+        return BotEquipmentHelper.wrapDegrees(degrees);
     }
 
     private void releaseMovement(Minecraft client) {
@@ -875,102 +815,12 @@ public class BotFollowController {
         return null;
     }
 
-    private void smoothLookAt(LocalPlayer player, double targetX, double targetY, double targetZ, float maxStep) {
-        double dx = targetX - player.getX();
-        double dy = targetY - player.getEyeY();
-        double dz = targetZ - player.getZ();
-        double distXZ = Math.sqrt(dx * dx + dz * dz);
-
-        float targetYaw = (float) Math.toDegrees(-Math.atan2(dx, dz));
-        float targetPitch = (float) Math.toDegrees(-Math.atan2(dy, distXZ));
-
-        smoothLookTowards(player, targetYaw, targetPitch, maxStep);
-    }
-
-    private static int getAxeTier(ItemStack stack) {
-        if (stack == null || stack.isEmpty()) return -1;
-        if (!(stack.getItem() instanceof AxeItem)) return -1;
-        if (stack.is(Items.NETHERITE_AXE)) return 6;
-        if (stack.is(Items.DIAMOND_AXE)) return 5;
-        if (stack.is(Items.IRON_AXE)) return 4;
-        if (stack.is(Items.STONE_AXE)) return 3;
-        if (stack.is(Items.GOLDEN_AXE)) return 2;
-        if (stack.is(Items.WOODEN_AXE)) return 1;
-        return 1;
-    }
-
     private boolean ensureBestAxeInMainHand(LocalPlayer player, MultiPlayerGameMode gameMode) {
-        ItemStack current = player.getMainHandItem();
-        int bestSlot = -1;
-        int bestTier = getAxeTier(current);
-
-        // فحص شريط الأدوات (Hotbar 0-8)
-        for (int i = 0; i < 9; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            int tier = getAxeTier(stack);
-            if (tier > bestTier) {
-                bestTier = tier;
-                bestSlot = i;
-            }
-        }
-
-        if (bestSlot != -1) {
-            player.getInventory().setSelectedSlot(bestSlot);
-            if (player.connection != null) {
-                player.connection.send(new ServerboundSetCarriedItemPacket(bestSlot));
-            }
-            return true;
-        }
-
-        if (bestTier > 0) {
-            return true;
-        }
-
-        // فحص الحقيبة (9-35) إن لم يكن هناك أي فأس في شريط الأدوات
-        int invBestSlot = -1;
-        for (int i = 9; i < 36; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            int tier = getAxeTier(stack);
-            if (tier > bestTier) {
-                bestTier = tier;
-                invBestSlot = i;
-            }
-        }
-
-        if (invBestSlot != -1) {
-            int targetHotbar = 0;
-            int containerId = player.inventoryMenu.containerId;
-            gameMode.handleContainerInput(containerId, invBestSlot, targetHotbar, ContainerInput.SWAP, player);
-            player.getInventory().setSelectedSlot(targetHotbar);
-            if (player.connection != null) {
-                player.connection.send(new ServerboundSetCarriedItemPacket(targetHotbar));
-            }
-            return true;
-        }
-
-        return false;
+        return BotEquipmentHelper.ensureBestInMainHand(player, gameMode, BotEquipmentHelper::getAxeTier, 1, 0);
     }
 
     private void ensureShieldInOffhand(LocalPlayer player, MultiPlayerGameMode gameMode) {
-        if (player.getOffhandItem().is(Items.SHIELD)) return;
-
-        int containerId = player.inventoryMenu.containerId;
-        // البحث في شريط الأدوات
-        for (int i = 0; i < 9; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.is(Items.SHIELD)) {
-                gameMode.handleContainerInput(containerId, 36 + i, 40, ContainerInput.SWAP, player);
-                return;
-            }
-        }
-        // البحث في الحقيبة
-        for (int i = 9; i < 36; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.is(Items.SHIELD)) {
-                gameMode.handleContainerInput(containerId, i, 40, ContainerInput.SWAP, player);
-                return;
-            }
-        }
+        BotEquipmentHelper.ensureInOffhand(player, gameMode, stack -> stack.is(Items.SHIELD));
     }
 
     private boolean hasAllowedGoldenApple(LocalPlayer player) {
@@ -1153,73 +1003,6 @@ public class BotFollowController {
         }
     }
 
-    /**
-     * التحقق مما إذا كان الدرع تعطل (ضربه فأس) ومحاولة استبداله فوراً بدرع آخر من الحقيبة.
-     */
-    @SuppressWarnings("unused")
-    private void checkShieldDisabledAndSwap(Minecraft client, LocalPlayer player, MultiPlayerGameMode gameMode) {
-        if (shieldSwapCooldown > 0) return;
-        if (!player.getCooldowns().isOnCooldown(new ItemStack(Items.SHIELD))) return;
-
-        shieldSwapCooldown = 100; // منع السبام لمدة 5 ثوانٍ
-        int containerId = player.inventoryMenu.containerId;
-
-        // البحث في الحقيبة الرئيسية
-        for (int i = 9; i < 36; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.is(Items.SHIELD)) {
-                gameMode.handleContainerInput(containerId, i, 40, ContainerInput.SWAP, player);
-                if (client.player != null) {
-                    client.player.sendSystemMessage(Component.literal("§e[Bot - Shield] تعطل الدرع بضربة فأس! تم استبداله بدرع احتياطي فوراً."));
-                }
-                return;
-            }
-        }
-        // البحث في شريط الأدوات
-        for (int i = 0; i < 9; i++) {
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty() && stack.is(Items.SHIELD)) {
-                gameMode.handleContainerInput(containerId, 36 + i, 40, ContainerInput.SWAP, player);
-                if (client.player != null) {
-                    client.player.sendSystemMessage(Component.literal("§e[Bot - Shield] تعطل الدرع بضربة فأس! تم استبداله بدرع احتياطي فوراً."));
-                }
-                return;
-            }
-        }
-    }
-
-    @SuppressWarnings("unused")
-    private Projectile findIncomingProjectile(ClientLevel level, LocalPlayer player, Player companion) {
-        AABB searchBox = player.getBoundingBox().inflate(14.0);
-        List<Projectile> projectiles = level.getEntitiesOfClass(Projectile.class, searchBox, p -> p.isAlive() && !p.isRemoved());
-
-        for (Projectile proj : projectiles) {
-            Vec3 vel = proj.getDeltaMovement();
-            if (vel.lengthSqr() < 0.05) continue;
-
-            Vec3 toBot = player.getEyePosition().subtract(proj.position());
-            double distToBot = toBot.length();
-            if (distToBot <= 12.0) {
-                double dot = vel.normalize().dot(toBot.normalize());
-                if (dot > 0.55) {
-                    return proj;
-                }
-            }
-
-            if (companion != null) {
-                Vec3 toComp = companion.getEyePosition().subtract(proj.position());
-                double distToComp = toComp.length();
-                if (distToComp <= 10.0) {
-                    double dot = vel.normalize().dot(toComp.normalize());
-                    if (dot > 0.60) {
-                        return proj;
-                    }
-                }
-            }
-        }
-        return null;
-    }
-
     public static Vec3 calculateCreeperEscapeDirection(ClientLevel level, LocalPlayer player, Vec3 creeperPos) {
         double awayX = player.getX() - creeperPos.x;
         double awayZ = player.getZ() - creeperPos.z;
@@ -1277,216 +1060,5 @@ public class BotFollowController {
         }
 
         return bestDir;
-    }
-
-    @SuppressWarnings("unused")
-    private boolean handleCreeperCombat(Minecraft client, LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode, Player companion, net.minecraft.world.entity.monster.Creeper creeper) {
-        // إذا مات الكريبر أو اختفى أو انفجر:
-        if (creeper == null || !creeper.isAlive() || creeper.isRemoved() || creeper.isDeadOrDying() || creeper.getHealth() <= 0) {
-            if (creeper != null) {
-                hostileTargets.remove(creeper.getUUID());
-                if (currentTargetUUID != null && currentTargetUUID.equals(creeper.getUUID())) {
-                    currentTargetUUID = null;
-                }
-            }
-            creeperState = CreeperTacticState.NONE;
-            creeperFleeStartPos = null;
-            creeperFleeDir = null;
-            creeperFleeTicks = 0;
-            creeperAssessTicks = 0;
-            releaseMovement(client);
-            if (player.isUsingItem() && player.getUseItem().is(Items.SHIELD)) {
-                gameMode.releaseUsingItem(player);
-                player.stopUsingItem();
-            }
-            client.options.keyUse.setDown(false);
-            return false;
-        }
-
-        // فحص مسافة الـ 20 بلوكة عن القائد:
-        double distToCompanion = player.distanceTo(companion);
-        if (distToCompanion > 20.0) {
-            creeperState = CreeperTacticState.NONE;
-            releaseMovement(client);
-            if (tetherAlertCooldown <= 0) {
-                client.player.sendSystemMessage(Component.literal("§e[Bot - Bodyguard] تجاوزت المسافة 20 بلوكة عن القائد! التوقف عن مطاردة الكريبر والعودة للقائد..."));
-                tetherAlertCooldown = 100;
-            }
-            smartNavigateTo(client, player, level, gameMode, companion.position(), true, 2.5, false);
-            return true;
-        }
-
-        // إذا لم تبدأ الحالة بعد:
-        if (creeperState == CreeperTacticState.NONE) {
-            creeperState = CreeperTacticState.APPROACH_AND_STRIKE;
-        }
-
-        double distToCreeper = player.distanceTo(creeper);
-
-        // ==========================================
-        // الحالة 1: الاقتراب والقفز والضرب بالفأس
-        // ==========================================
-        if (creeperState == CreeperTacticState.APPROACH_AND_STRIKE) {
-            ensureBestAxeInMainHand(player, gameMode);
-            // خفض الدرع حتى لا يعيق سرعة البوت وضربته
-            if (client.options.keyUse.isDown()) {
-                client.options.keyUse.setDown(false);
-            }
-            if (player.isUsingItem() && player.getUseItem().is(Items.SHIELD)) {
-                gameMode.releaseUsingItem(player);
-                player.stopUsingItem();
-            }
-
-            smoothLookAt(player, creeper.getX(), creeper.getEyeY() - 0.15, creeper.getZ(), 60.0f);
-
-            @SuppressWarnings("unused")
-            float charge = player.getAttackStrengthScale(0.0f);
-            boolean isSwelling = creeper.getSwellDir() > 0;
-
-            if (distToCreeper <= 3.2) {
-                if (player.onGround() && !isJumpingForCrit) {
-                    // القفز للأعلى لتنفيذ ضربة حرجة حاسمة
-                    isJumpingForCrit = true;
-                    jumpCritTicks = 0;
-                    client.options.keyJump.setDown(true);
-                    client.options.keyUp.setDown(distToCreeper > 1.8);
-                } else {
-                    jumpCritTicks++;
-                    boolean isFalling = player.getDeltaMovement().y < -0.01;
-                    boolean jumpTimeout = jumpCritTicks > 12;
-
-                    // الهجوم في لحظة الهبوط أو إذا كان الكريبر ينتفخ بسرعة
-                    if (isFalling || jumpTimeout || isSwelling) {
-                        smoothLookAt(player, creeper.getX(), creeper.getEyeY() - 0.15, creeper.getZ(), 90.0f);
-                        gameMode.attack(player, creeper);
-                        player.swing(InteractionHand.MAIN_HAND);
-
-                        // التحقق هل مات الكريبر من الضربة:
-                        if (!creeper.isAlive() || creeper.isRemoved() || creeper.isDeadOrDying() || creeper.getHealth() <= 0) {
-                            hostileTargets.remove(creeper.getUUID());
-                            if (currentTargetUUID != null && currentTargetUUID.equals(creeper.getUUID())) {
-                                currentTargetUUID = null;
-                            }
-                            creeperState = CreeperTacticState.NONE;
-                            releaseMovement(client);
-                            return false;
-                        }
-
-                        // فوراً في نفس اللحظة الانتقال لحالة الهروب الأقصى لمسافة 10 بلوكات!
-                        creeperState = CreeperTacticState.FLEE_SPRINT_JUMP;
-                        creeperFleeStartPos = player.position();
-                        creeperFleeDir = calculateCreeperEscapeDirection(level, player, creeper.position());
-                        creeperFleeTicks = 0;
-                        isJumpingForCrit = false;
-                        jumpCritTicks = 0;
-                    }
-                }
-            } else {
-                // الكريبر أبعد من 3.2 بلوكات: الركض السريع نحوه بالفأس
-                client.options.keyDown.setDown(false);
-                client.options.keyUp.setDown(true);
-                client.options.keySprint.setDown(true);
-                player.setSprinting(true);
-                if (moveJumpCooldown <= 0 && isObstacleDirectlyAhead(player, level, creeper.getX(), creeper.getZ()) && player.onGround() && isCeilingClear(level, player.blockPosition())) {
-                    client.options.keyJump.setDown(true);
-                    moveJumpCooldown = 10;
-                } else {
-                    client.options.keyJump.setDown(false);
-                }
-                isJumpingForCrit = false;
-                jumpCritTicks = 0;
-            }
-            return true;
-        }
-
-        // ==========================================
-        // الحالة 2: الركض والقفز بأقصى سرعة لمسافة 10 بلوكات في الجهة المعاكسة
-        // ==========================================
-        if (creeperState == CreeperTacticState.FLEE_SPRINT_JUMP) {
-            if (creeperFleeStartPos == null || creeperFleeDir == null) {
-                creeperFleeStartPos = player.position();
-                creeperFleeDir = calculateCreeperEscapeDirection(level, player, creeper.position());
-            }
-
-            double fledDist = player.position().distanceTo(creeperFleeStartPos);
-            creeperFleeTicks++;
-
-            // خفض الدرع والأكل تماماً لتحقيق أقصى سرعة ممكنة
-            if (client.options.keyUse.isDown()) {
-                client.options.keyUse.setDown(false);
-            }
-            if (player.isUsingItem()) {
-                gameMode.releaseUsingItem(player);
-                player.stopUsingItem();
-            }
-
-            // توجيه وجه ورأس وجسد اللاعب نحو مسار الهروب المعاكس تماماً
-            float runYaw = (float) (Math.atan2(creeperFleeDir.z, creeperFleeDir.x) * 180.0 / Math.PI) - 90.0f;
-            player.setYRot(runYaw);
-            player.yHeadRot = runYaw;
-            player.yBodyRot = runYaw;
-            player.setXRot(0.0f);
-
-            // تفعيل الركض والقفز بنبضات محسوبة للهروب السريع دون التعليق في الجدران
-            client.options.keyUp.setDown(true);
-            client.options.keyDown.setDown(false);
-            client.options.keyLeft.setDown(false);
-            client.options.keyRight.setDown(false);
-            client.options.keySprint.setDown(true);
-            player.setSprinting(true);
-
-            if (player.onGround() && moveJumpCooldown <= 0 && isCeilingClear(level, player.blockPosition())) {
-                client.options.keyJump.setDown(true);
-                moveJumpCooldown = 8;
-            } else {
-                client.options.keyJump.setDown(false);
-            }
-
-            // فحص قطع مسافة الـ 10 بلوكات:
-            if (fledDist >= 10.0 || distToCreeper >= 12.0 || creeperFleeTicks > 45) {
-                // إيقاف الهروب والانتقال للتقييم والنظر
-                client.options.keyUp.setDown(false);
-                client.options.keyJump.setDown(false);
-                client.options.keySprint.setDown(false);
-                player.setSprinting(false);
-                creeperState = CreeperTacticState.ASSESS;
-                creeperAssessTicks = 0;
-            }
-            return true;
-        }
-
-        // ==========================================
-        // الحالة 3: التقييم والنظر نحو الكريبر
-        // ==========================================
-        if (creeperState == CreeperTacticState.ASSESS) {
-            client.options.keyUp.setDown(false);
-            client.options.keyJump.setDown(false);
-            client.options.keySprint.setDown(false);
-            player.setSprinting(false);
-
-            smoothLookAt(player, creeper.getX(), creeper.getEyeY() - 0.15, creeper.getZ(), 85.0f);
-
-            // فحص هل الكريبر ما زال حياً؟
-            if (!creeper.isAlive() || creeper.isRemoved() || creeper.isDeadOrDying() || creeper.getHealth() <= 0) {
-                hostileTargets.remove(creeper.getUUID());
-                if (currentTargetUUID != null && currentTargetUUID.equals(creeper.getUUID())) {
-                    currentTargetUUID = null;
-                }
-                creeperState = CreeperTacticState.NONE;
-                releaseMovement(client);
-                return false;
-            }
-
-            // الكريبر لا زال حياً: الانتظار بضع تكات لاكتمال شحن الفأس ثم العودة وتكرار الهجوم!
-            creeperAssessTicks++;
-            float charge = player.getAttackStrengthScale(0.0f);
-            if (charge >= 0.90f || creeperAssessTicks >= 10) {
-                creeperState = CreeperTacticState.APPROACH_AND_STRIKE;
-                creeperAssessTicks = 0;
-            }
-            return true;
-        }
-
-        return false;
     }
 }

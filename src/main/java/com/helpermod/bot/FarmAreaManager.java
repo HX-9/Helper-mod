@@ -28,7 +28,6 @@ public class FarmAreaManager {
     private final Map<String, FarmArea> areas = new LinkedHashMap<>();
     private BlockPos pos1;
     private BlockPos pos2;
-    private String activeAreaName;
     private boolean sleepAtNight = true;
     private BlockPos bedPos = null;
     private String awaitingChestFarmName = null;
@@ -122,8 +121,28 @@ public class FarmAreaManager {
         if (name == null || name.isBlank() || p1 == null || p2 == null) {
             return false;
         }
-        FarmArea area = new FarmArea(name.toLowerCase(), p1, p2, crop);
-        areas.put(name.toLowerCase(), area);
+        String key = name.toLowerCase();
+        if (areas.containsKey(key)) {
+            return false;
+        }
+        FarmArea area = new FarmArea(key, p1, p2, crop);
+        areas.put(key, area);
+        save();
+        return true;
+    }
+
+    /**
+     * تحديث إحداثيات منطقة قائمة مع الاحتفاظ بالمحصول والصندوق المرتبط بها.
+     */
+    public boolean updateAreaBounds(String name, BlockPos p1, BlockPos p2) {
+        if (name == null || p1 == null || p2 == null) {
+            return false;
+        }
+        FarmArea area = areas.get(name.toLowerCase());
+        if (area == null) {
+            return false;
+        }
+        area.updateBounds(p1, p2);
         save();
         return true;
     }
@@ -131,9 +150,6 @@ public class FarmAreaManager {
     public boolean removeArea(String name) {
         if (name == null) return false;
         String key = name.toLowerCase();
-        if (key.equals(activeAreaName)) {
-            activeAreaName = null;
-        }
         boolean removed = areas.remove(key) != null;
         if (removed) {
             save();
@@ -158,10 +174,6 @@ public class FarmAreaManager {
             areas.remove(oldKey);
             area.setName(newKey);
             areas.put(newKey, area);
-
-            if (oldKey.equals(activeAreaName)) {
-                activeAreaName = newKey;
-            }
         }
         save();
         return true;
@@ -176,23 +188,74 @@ public class FarmAreaManager {
         return Collections.unmodifiableCollection(areas.values());
     }
 
+    public boolean setAreaEnabled(String name, boolean enabled) {
+        if (name == null) return false;
+        FarmArea area = areas.get(name.toLowerCase());
+        if (area == null) {
+            return false;
+        }
+        area.setEnabled(enabled);
+        save();
+        return true;
+    }
+
+    public void setAllAreasEnabled(boolean enabled) {
+        for (FarmArea area : areas.values()) {
+            area.setEnabled(enabled);
+        }
+        save();
+    }
+
     public String getActiveAreaName() {
-        return activeAreaName;
+        List<FarmArea> active = getActiveAreas();
+        if (active.size() == 1) {
+            return active.get(0).getName();
+        }
+        return null;
     }
 
     public void setActiveAreaName(String activeAreaName) {
-        this.activeAreaName = activeAreaName != null ? activeAreaName.toLowerCase() : null;
+        if (activeAreaName == null) {
+            setAllAreasEnabled(true);
+            return;
+        }
+        String key = activeAreaName.toLowerCase();
+        if (!areas.containsKey(key)) {
+            return;
+        }
+        for (FarmArea area : areas.values()) {
+            area.setEnabled(area.getName().equalsIgnoreCase(key));
+        }
         save();
     }
 
     public List<FarmArea> getActiveAreas() {
-        if (activeAreaName != null) {
-            FarmArea single = areas.get(activeAreaName);
-            if (single != null) {
-                return List.of(single);
+        List<FarmArea> active = new ArrayList<>();
+        for (FarmArea area : areas.values()) {
+            if (area.isEnabled()) {
+                active.add(area);
             }
         }
-        return new ArrayList<>(areas.values());
+        return active;
+    }
+
+    public String getActiveAreasSummary() {
+        if (areas.isEmpty()) {
+            return "لا توجد مزارع مسجلة";
+        }
+        List<String> enabledNames = new ArrayList<>();
+        for (FarmArea area : areas.values()) {
+            if (area.isEnabled()) {
+                enabledNames.add(area.getName());
+            }
+        }
+        if (enabledNames.isEmpty()) {
+            return "لا توجد مزارع مفعلة (0 من " + areas.size() + ")";
+        }
+        if (enabledNames.size() == areas.size()) {
+            return "جميع المناطق (" + areas.size() + " مفعلة)";
+        }
+        return String.join("، ", enabledNames) + " (" + enabledNames.size() + " من " + areas.size() + " مفعلة)";
     }
 
     public FarmArea findAreaContaining(BlockPos pos) {
@@ -212,9 +275,6 @@ public class FarmAreaManager {
         try {
             Path file = getConfigFile();
             JsonObject root = new JsonObject();
-            if (activeAreaName != null) {
-                root.addProperty("activeArea", activeAreaName);
-            }
             root.addProperty("sleepAtNight", sleepAtNight);
             if (bedPos != null) {
                 JsonObject b = new JsonObject();
@@ -258,6 +318,8 @@ public class FarmAreaManager {
                     obj.add("chestPos", c);
                 }
 
+                obj.addProperty("enabled", area.isEnabled());
+
                 array.add(obj);
             }
             root.add("areas", array);
@@ -285,8 +347,9 @@ public class FarmAreaManager {
 
         try (Reader reader = Files.newBufferedReader(file)) {
             JsonObject root = JsonParser.parseReader(reader).getAsJsonObject();
-            if (root.has("activeArea")) {
-                this.activeAreaName = root.get("activeArea").getAsString();
+            String legacyActiveArea = null;
+            if (root.has("activeArea") && !root.get("activeArea").isJsonNull()) {
+                legacyActiveArea = root.get("activeArea").getAsString();
             }
             if (root.has("sleepAtNight")) {
                 this.sleepAtNight = root.get("sleepAtNight").getAsBoolean();
@@ -324,6 +387,13 @@ public class FarmAreaManager {
                     if (obj.has("chestPos") && obj.get("chestPos").isJsonObject()) {
                         JsonObject c = obj.getAsJsonObject("chestPos");
                         area.setChestPos(new BlockPos(c.get("x").getAsInt(), c.get("y").getAsInt(), c.get("z").getAsInt()));
+                    }
+                    if (obj.has("enabled") && !obj.get("enabled").isJsonNull()) {
+                        area.setEnabled(obj.get("enabled").getAsBoolean());
+                    } else if (legacyActiveArea != null) {
+                        area.setEnabled(name.equalsIgnoreCase(legacyActiveArea));
+                    } else {
+                        area.setEnabled(true);
                     }
                     areas.put(name.toLowerCase(), area);
                 }
