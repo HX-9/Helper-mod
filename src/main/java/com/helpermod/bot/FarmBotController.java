@@ -993,6 +993,13 @@ public class FarmBotController {
                 actionsInCurrentFarm++;
                 cooldownTicks = 4;
             } else if (target.type == ActionType.TILL) {
+                if (!isValidTillableSpot(level, target.area, pos)) {
+                    currentPath = null;
+                    currentGoal = null;
+                    cooldownTicks = 1;
+                    return;
+                }
+
                 // توجيه الكاميرا بنعومة نحو سطح التربة التالفة
                 boolean aimed = smoothLookAt(player, targetCenterX, targetCenterY, targetCenterZ, ROTATION_SPEED);
                 if (!aimed) {
@@ -1027,6 +1034,13 @@ public class FarmBotController {
                     cooldownTicks = 2;
                 }
             } else if (target.type == ActionType.PLANT) {
+                if (!isAirDrySpace(level, pos)) {
+                    currentPath = null;
+                    currentGoal = null;
+                    cooldownTicks = 1;
+                    return;
+                }
+
                 // تدوير الكاميرا بنعومة نحو سطح التربة
                 boolean aimed = smoothLookAt(player, targetCenterX, pos.getY(), targetCenterZ, ROTATION_SPEED);
                 if (!aimed) {
@@ -1805,6 +1819,10 @@ public class FarmBotController {
     }
 
     private TargetAction findClosestTillTargetInArea(LocalPlayer player, ClientLevel level, FarmArea area) {
+        if (area.getTargetCrop() == FarmCrop.NETHER_WART) {
+            return null;
+        }
+
         boolean canTill = (player.getMainHandItem().getItem() instanceof HoeItem) || (findHoeInHotbar(player) != -1) || hasHoeInInventory(player);
         if (!canTill) {
             return null;
@@ -1824,22 +1842,14 @@ public class FarmBotController {
                     BlockState state = level.getBlockState(pos);
 
                     BlockPos dirtPos = null;
-
                     if (isTillableSoil(state)) {
-                        BlockState above = level.getBlockState(pos.above());
-                        if (above.isAir() || above.canBeReplaced()) {
-                            dirtPos = pos;
-                        }
-                    } else if (state.isAir()) {
-                        BlockPos below = pos.below();
-                        BlockState belowState = level.getBlockState(below);
-                        if (isTillableSoil(belowState)) {
-                            dirtPos = below;
-                        }
+                        dirtPos = pos;
+                    } else if (isAirDrySpace(level, pos)) {
+                        dirtPos = pos.below();
                     }
 
                     if (dirtPos != null) {
-                        if (unreachablePositions.contains(dirtPos)) continue;
+                        if (unreachablePositions.contains(dirtPos) || !isValidTillableSpot(level, area, dirtPos)) continue;
                         double dist = player.distanceToSqr(dirtPos.getX() + 0.5, dirtPos.getY() + 1.0, dirtPos.getZ() + 0.5);
                         if (dist < bestDistSq) {
                             bestDistSq = dist;
@@ -1856,6 +1866,29 @@ public class FarmBotController {
         return state.is(Blocks.DIRT) || state.is(Blocks.GRASS_BLOCK) || state.is(Blocks.DIRT_PATH) || state.is(Blocks.COARSE_DIRT) || state.is(Blocks.ROOTED_DIRT);
     }
 
+    /**
+     * التحقق من أن الموقع عبارة عن هواء جاف خالٍ من الماء أو أي سائل
+     */
+    private boolean isAirDrySpace(ClientLevel level, BlockPos pos) {
+        return level.getBlockState(pos).isAir() && level.getFluidState(pos).isEmpty() && !FarmPathfinder.isWater(level, pos);
+    }
+
+    /**
+     * التحقق من صلاحية التربة للحرث: تربة صالحة وفوقها هواء جاف خالٍ من الماء
+     */
+    private boolean isValidTillableSpot(ClientLevel level, FarmArea area, BlockPos dirtPos) {
+        if (area != null && area.getTargetCrop() == FarmCrop.NETHER_WART) {
+            return false;
+        }
+        if (!isTillableSoil(level.getBlockState(dirtPos))) {
+            return false;
+        }
+        if (!level.getFluidState(dirtPos).isEmpty() || FarmPathfinder.isWater(level, dirtPos)) {
+            return false;
+        }
+        return isAirDrySpace(level, dirtPos.above());
+    }
+
     private TargetAction findClosestPlantTargetInArea(LocalPlayer player, ClientLevel level, FarmArea area) {
         TargetAction best = null;
         double bestDistSq = Double.MAX_VALUE;
@@ -1868,9 +1901,8 @@ public class FarmBotController {
                 for (int z = min.getZ(); z <= max.getZ(); z++) {
                     BlockPos pos = new BlockPos(x, y, z);
                     if (unreachablePositions.contains(pos)) continue;
-                    BlockState state = level.getBlockState(pos);
 
-                    if (state.isAir()) {
+                    if (isAirDrySpace(level, pos)) {
                         BlockState soilState = level.getBlockState(pos.below());
                         FarmCrop cropToPlant = area.getTargetCrop();
                         if (cropToPlant == null) {
@@ -2327,8 +2359,7 @@ public class FarmBotController {
                 for (int z = min.getZ(); z <= max.getZ(); z++) {
                     BlockPos pos = new BlockPos(x, y, z);
                     if (unreachablePositions.contains(pos)) continue;
-                    BlockState state = level.getBlockState(pos);
-                    if (state.isAir()) {
+                    if (isAirDrySpace(level, pos)) {
                         BlockState below = level.getBlockState(pos.below());
                         if (below.is(Blocks.FARMLAND) || below.is(Blocks.SOUL_SAND)) {
                             return true;
@@ -2351,8 +2382,7 @@ public class FarmBotController {
             for (int x = min.getX(); x <= max.getX(); x++) {
                 for (int z = min.getZ(); z <= max.getZ(); z++) {
                     BlockPos pos = new BlockPos(x, y, z);
-                    BlockState state = level.getBlockState(pos);
-                    if (state.isAir()) {
+                    if (isAirDrySpace(level, pos)) {
                         FarmCrop rem = area.getRememberedCrop(pos);
                         if (rem != null) return rem;
                         BlockState below = level.getBlockState(pos.below());
