@@ -62,6 +62,8 @@ public class BotCombatManager {
     private int shieldSwapCooldown = 0;
     private int enemyScanCooldown = 0;
     private int arrowDefenseCooldown = 0;
+    private int armorCheckCooldown = 0;
+    private final RangedCombatHelper rangedHelper = new RangedCombatHelper();
 
     // تتبع صحة القائد وصحة البوت لرصد الاعتداءات
     private float lastCompanionHealth = -1.0f;
@@ -101,9 +103,17 @@ public class BotCombatManager {
         if (shieldSwapCooldown > 0) shieldSwapCooldown--;
         if (enemyScanCooldown > 0) enemyScanCooldown--;
         if (arrowDefenseCooldown > 0) arrowDefenseCooldown--;
+        if (armorCheckCooldown > 0) armorCheckCooldown--;
         if (targetLockTicks > 0) targetLockTicks--;
         if (weaponChoiceLockTicks > 0) weaponChoiceLockTicks--;
         combatNavigator.tickCooldowns();
+
+        // صيانة الدروع وتوتم البقاء باستمرار دون تعطيل سحب السلاح أو الأكل
+        boolean checkArmorNow = armorCheckCooldown <= 0 && !player.isUsingItem() && !rangedHelper.isUsingRanged();
+        if (checkArmorNow) {
+            armorCheckCooldown = 25;
+        }
+        BotEquipmentHelper.maintainCombatSurvivalGear(player, gameMode, checkArmorNow, true);
 
         unreachableTargets.entrySet().removeIf(entry -> {
             int rem = entry.getValue() - 1;
@@ -114,6 +124,7 @@ public class BotCombatManager {
 
         // حراسة التنفس الطارئة في الماء (الطفو أو الهروب من السقف قبل الغرق مع السماح بالغوص الحر)
         if (combatNavigator.handleUrgentWaterBreathing(client, player, level, gameMode)) {
+            rangedHelper.reset(client, player, gameMode);
             releaseShield(client, player, gameMode);
             isJumpingForAxeCrit = false;
             axeCritTicks = 0;
@@ -127,6 +138,7 @@ public class BotCombatManager {
         LivingEntity target = getActiveHostileTarget(level, player, companion, distToCompanion);
 
         if (target == null) {
+            rangedHelper.reset(client, player, gameMode);
             releaseShield(client, player, gameMode);
             if (creeperState != CreeperCombatState.NONE) {
                 creeperState = CreeperCombatState.NONE;
@@ -155,6 +167,7 @@ public class BotCombatManager {
         }
 
         if (!shouldEngage) {
+            rangedHelper.reset(client, player, gameMode);
             lockedTargetUUID = null;
             combatNavigator.clearPathOnly();
             releaseShield(client, player, gameMode);
@@ -169,11 +182,31 @@ public class BotCombatManager {
      * تنفيذ القتال التكتيكي بالكامل
      */
     private boolean executeTacticalCombat(Minecraft client, LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode, Player companion, LivingEntity enemy, double distToEnemy, double eyeDistToEnemy) {
-        // 1. فحص الكريبر كحالة تكتيكية استثنائية (ضربة ثم هروب 10 بلوكات)
+        boolean botIncomingProjectile = findIncomingProjectile(level, player, null) != null;
+
+        // 1. فحص الكريبر: إن توفّر سلاح مدى وخط رؤية مفتوح من مسافة آمنة (>= 5 بلوكات) يتم قنصه قبل الاقتراب
         boolean isCreeper = enemy instanceof Creeper
             || (enemy instanceof Mob mob && mob.getType().getDescriptionId().contains("creeper"));
 
         if (isCreeper && enemy instanceof Creeper creeper) {
+            if (creeperState != CreeperCombatState.FLEE_SPRINT_JUMP && distToEnemy >= 5.0) {
+                RangedCombatHelper.RangedStatus creeperRanged = rangedHelper.tickRangedAttack(
+                    client, player, level, gameMode, creeper, companion, botIncomingProjectile, false
+                );
+                if (creeperRanged == RangedCombatHelper.RangedStatus.CHARGING
+                        || creeperRanged == RangedCombatHelper.RangedStatus.FIRED) {
+                    combatNavigator.clearPathOnly();
+                    ensureShieldInOffhand(player, gameMode);
+                    return true;
+                }
+                if (creeperRanged == RangedCombatHelper.RangedStatus.YIELD_FOR_SHIELD) {
+                    ensureShieldInOffhand(player, gameMode);
+                    raiseShield(client, player, gameMode);
+                    return true;
+                }
+            } else {
+                rangedHelper.reset(client, player, gameMode);
+            }
             return executeCreeperTactics(client, player, level, gameMode, creeper, distToEnemy, eyeDistToEnemy);
         } else {
             if (creeperState != CreeperCombatState.NONE) {
@@ -183,7 +216,35 @@ public class BotCombatManager {
             }
         }
 
-        // 2. تحديد نوع السلاح التكتيكي مع مراعاة حماية القائد والحلفاء من ضربة Sweeping Edge
+        // 2. القتال بعيد المدى (Bow / Crossbow) قبل الدخول في مدى الاشتباك القريب
+        boolean inMeleeReach = eyeDistToEnemy <= 2.95 && distToEnemy <= 3.6;
+        if (!inMeleeReach) {
+            RangedCombatHelper.RangedStatus rangedStatus = rangedHelper.tickRangedAttack(
+                client,
+                player,
+                level,
+                gameMode,
+                enemy,
+                companion,
+                botIncomingProjectile,
+                unreachableTargets.containsKey(enemy.getUUID())
+            );
+            if (rangedStatus == RangedCombatHelper.RangedStatus.CHARGING
+                    || rangedStatus == RangedCombatHelper.RangedStatus.FIRED) {
+                combatNavigator.clearPathOnly();
+                ensureShieldInOffhand(player, gameMode);
+                return true;
+            }
+            if (rangedStatus == RangedCombatHelper.RangedStatus.YIELD_FOR_SHIELD) {
+                ensureShieldInOffhand(player, gameMode);
+                raiseShield(client, player, gameMode);
+                return true;
+            }
+        } else {
+            rangedHelper.reset(client, player, gameMode);
+        }
+
+        // 3. تحديد نوع السلاح التكتيكي مع مراعاة حماية القائد والحلفاء من ضربة Sweeping Edge
         WeaponMode weaponMode = determineWeaponChoice(player, level, companion, enemy);
 
         if (weaponMode == WeaponMode.SWORD) {
@@ -195,9 +256,7 @@ public class BotCombatManager {
         ensureShieldInOffhand(player, gameMode);
         checkShieldDisabledAndSwap(client, player, gameMode);
 
-        // 3. فحص مدى الهجوم الحقيقي من العين لصندوق تصادم العدو
-        boolean inMeleeReach = eyeDistToEnemy <= 2.95 && distToEnemy <= 3.6;
-
+        // 4. فحص مدى الهجوم الحقيقي من العين لصندوق تصادم العدو
         if (inMeleeReach) {
             smoothLookAt(player, enemy.getX(), enemy.getEyeY() - 0.15, enemy.getZ(), 50.0f);
             float charge = player.getAttackStrengthScale(0.0f);
@@ -311,7 +370,20 @@ public class BotCombatManager {
             );
 
             if (navRes == BotNavigator.NavResult.BLOCKED_UNREACHABLE) {
-                // العدو خلف زجاج أو جدار أو وادٍ مقطوع: فك القفل مؤقتاً والعودة لمتابعة القائد
+                RangedCombatHelper.RangedStatus fallbackRanged = rangedHelper.tickRangedAttack(
+                    client, player, level, gameMode, enemy, companion, botIncomingProjectile, true
+                );
+                if (fallbackRanged == RangedCombatHelper.RangedStatus.CHARGING
+                        || fallbackRanged == RangedCombatHelper.RangedStatus.FIRED) {
+                    combatNavigator.clearPathOnly();
+                    return true;
+                }
+                if (fallbackRanged == RangedCombatHelper.RangedStatus.YIELD_FOR_SHIELD) {
+                    raiseShield(client, player, gameMode);
+                    return true;
+                }
+
+                // العدو خلف زجاج أو جدار أو وادٍ مقطوع دون خط رمي صالح: فك القفل مؤقتاً والعودة لمتابعة القائد
                 unreachableTargets.put(enemy.getUUID(), 40);
                 lockedTargetUUID = null;
                 targetLockTicks = 0;
@@ -862,9 +934,11 @@ public class BotCombatManager {
     public void resetCombat(Minecraft client) {
         hostileTargets.clear();
         unreachableTargets.clear();
+        rangedHelper.reset(client);
         combatNavigator.reset(client);
         lockedTargetUUID = null;
         targetLockTicks = 0;
+        armorCheckCooldown = 0;
         weaponChoiceLockTicks = 0;
         currentWeaponChoice = WeaponMode.SWORD;
         isJumpingForAxeCrit = false;

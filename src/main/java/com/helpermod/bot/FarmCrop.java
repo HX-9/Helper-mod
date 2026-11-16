@@ -49,6 +49,13 @@ public enum FarmCrop {
         return soilBlock;
     }
 
+    /**
+     * هل لهذا المحصول بذرة منفصلة عن المحصول المحصود نفسه (مثل القمح والشمندر).
+     */
+    public boolean hasDistinctSeedItem() {
+        return this == WHEAT || this == BEETROOT;
+    }
+
     public boolean isMature(BlockState state) {
         if (state.getBlock() != cropBlock) {
             return false;

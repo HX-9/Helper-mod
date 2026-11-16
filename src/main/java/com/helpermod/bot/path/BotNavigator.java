@@ -10,8 +10,10 @@ import net.minecraft.core.Direction;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.CropBlock;
 import net.minecraft.world.level.block.DoorBlock;
 import net.minecraft.world.level.block.FenceGateBlock;
+import net.minecraft.world.level.block.NetherWartBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
@@ -41,11 +43,27 @@ public class BotNavigator {
         BLOCKED_UNREACHABLE
     }
 
+    private enum DoorHandlingState {
+        NONE,
+        STEPPING_THROUGH,
+        TURNING_AND_CLOSING,
+        CONFIRMING
+    }
+
     private final List<BlockPos> currentPath = new ArrayList<>();
     private BlockPos lastGoalPos = null;
     private int pathRecalcCooldown = 0;
     private int doorInteractCooldown = 0;
     private int jumpCooldown = 0;
+    private boolean lastStepBlockedUnreachable = false;
+
+    // دورة فتح وإغلاق الأبواب وبوابات السياج تلقائياً بعد العبور
+    private DoorHandlingState doorState = DoorHandlingState.NONE;
+    private BlockPos activeDoorPos = null;
+    private Vec3 activeDoorEntryPos = null;
+    private BlockPos lastClosedDoorPos = null;
+    private int doorStateTicks = 0;
+    private int doorConfirmTicks = 0;
 
     // كاشف التعثر بنافذة زمنية (10 تكات) لمنع التصفير بسبب التذبذب الطفيف عند الحواف
     private Vec3 stuckWindowAnchorPos = null;
@@ -58,6 +76,29 @@ public class BotNavigator {
     private boolean recoveringAir = false;
     private final List<BlockPos> airEscapePath = new ArrayList<>();
     private int airEscapeRecalcCooldown = 0;
+
+    public List<BlockPos> getCurrentPath() {
+        return Collections.unmodifiableList(currentPath);
+    }
+
+    public boolean isBusyClosingDoor() {
+        return doorState == DoorHandlingState.TURNING_AND_CLOSING || doorState == DoorHandlingState.CONFIRMING;
+    }
+
+    public boolean didLastStepFailUnreachable() {
+        return lastStepBlockedUnreachable;
+    }
+
+    public void resetDoorState(Minecraft client) {
+        activeDoorPos = null;
+        activeDoorEntryPos = null;
+        doorState = DoorHandlingState.NONE;
+        doorStateTicks = 0;
+        doorConfirmTicks = 0;
+        if (client != null && client.options != null) {
+            client.options.keySprint.setDown(false);
+        }
+    }
 
     public void tickCooldowns() {
         if (pathRecalcCooldown > 0) pathRecalcCooldown--;
@@ -72,6 +113,9 @@ public class BotNavigator {
         pathRecalcCooldown = 0;
         doorInteractCooldown = 0;
         jumpCooldown = 0;
+        lastStepBlockedUnreachable = false;
+        lastClosedDoorPos = null;
+        resetDoorState(client);
         stuckWindowAnchorPos = null;
         stuckWindowTicks = 0;
         stuckStages = 0;
@@ -86,6 +130,8 @@ public class BotNavigator {
         currentPath.clear();
         lastGoalPos = null;
         pathRecalcCooldown = 0;
+        lastStepBlockedUnreachable = false;
+        resetDoorState(null);
     }
 
     public NavResult navigateTo(
@@ -100,12 +146,61 @@ public class BotNavigator {
             float maxTurnSpeed,
             boolean rotateLook,
             int maxNodes) {
+        return navigateTo(
+            client,
+            player,
+            level,
+            gameMode,
+            destination,
+            allowSprint,
+            stopDist,
+            isEating,
+            maxTurnSpeed,
+            rotateLook,
+            maxNodes,
+            FarmPathfinder.PathOptions.COMBAT_FOLLOW,
+            false,
+            false,
+            null
+        );
+    }
+
+    public NavResult navigateTo(
+            Minecraft client,
+            LocalPlayer player,
+            ClientLevel level,
+            MultiPlayerGameMode gameMode,
+            Vec3 destination,
+            boolean allowSprint,
+            double stopDist,
+            boolean isEating,
+            float maxTurnSpeed,
+            boolean rotateLook,
+            int maxNodes,
+            FarmPathfinder.PathOptions pathOptions,
+            boolean protectFarmSoil,
+            boolean closeDoorsAfterCrossing,
+            Vec3 companionPos) {
         if (client == null || player == null || level == null || destination == null) {
             return NavResult.BLOCKED_UNREACHABLE;
         }
+        lastStepBlockedUnreachable = false;
+        FarmPathfinder.PathOptions resolvedOptions = pathOptions != null ? pathOptions : FarmPathfinder.PathOptions.COMBAT_FOLLOW;
 
         // 0. حارس التنفس تحت الماء: إذا احتاج البوت للأكسجين يعطي الأولوية للسطح/الجيب الهوائي ثم يعاود
         if (handleUrgentWaterBreathing(client, player, level, gameMode)) {
+            if (doorState != DoorHandlingState.NONE) {
+                resetDoorState(client);
+            }
+            return NavResult.MOVING;
+        }
+
+        // 0.5 إدارة دورة إغلاق الباب بعد عبوره (تُلغى إذا انتهت الحاجة أو عند تعطل الإغلاق)
+        if (!closeDoorsAfterCrossing) {
+            if (doorState != DoorHandlingState.NONE) {
+                resetDoorState(client);
+            }
+        } else if (handleDoorCycle(client, player, level, gameMode, companionPos)) {
             return NavResult.MOVING;
         }
 
@@ -134,7 +229,7 @@ public class BotNavigator {
         BlockPos goalPos = BlockPos.containing(destination.x, destination.y, destination.z);
 
         // 2. كاشف التعثر بنافذة زمنية (كل 10 تكات)
-        updateStuckDetector(client, player, level, gameMode, destination);
+        updateStuckDetector(client, player, level, gameMode, destination, protectFarmSoil, closeDoorsAfterCrossing);
 
         // 3. التحقق من صلاحية المسار الحالي وإعادة الحساب عند الحاجة
         boolean pathInvalid = isCurrentPathBlocked(level);
@@ -151,7 +246,7 @@ public class BotNavigator {
                 player.blockPosition(),
                 goalPos,
                 maxNodes,
-                FarmPathfinder.PathOptions.COMBAT_FOLLOW
+                resolvedOptions
             );
             currentPath.clear();
             if (!res.path().isEmpty()) {
@@ -207,6 +302,7 @@ public class BotNavigator {
                 } else {
                     BotEquipmentHelper.releaseMovementKeys(client);
                     maintainWaterBuoyancy(client, player, level, null);
+                    lastStepBlockedUnreachable = true;
                     return NavResult.BLOCKED_UNREACHABLE;
                 }
             } else {
@@ -219,19 +315,27 @@ public class BotNavigator {
             } else {
                 BotEquipmentHelper.releaseMovementKeys(client);
                 maintainWaterBuoyancy(client, player, level, null);
+                lastStepBlockedUnreachable = true;
                 return NavResult.BLOCKED_UNREACHABLE;
             }
         }
 
-        // 5. فتح الأبواب وبوابات السياج استباقياً قبل التصادم
-        openDoorsAhead(player, level, gameMode, nextTarget.x, nextTarget.z);
+        // 5. فتح الأبواب وبوابات السياج استباقياً قبل التصادم وتتبع العبور عند تفعيل الإغلاق التلقائي
+        openDoorsAhead(player, level, gameMode, nextTarget.x, nextTarget.z, closeDoorsAfterCrossing);
 
-        // 6. تنفيذ الحركة الآمنة مع فحص المخاطر والسقوط والسباحة والغوص
-        executeMove(client, player, level, nextTarget.x, nextTarget.y, nextTarget.z, allowSprint, isEating, maxTurnSpeed, rotateLook);
+        // 6. تنفيذ الحركة الآمنة مع فحص المخاطر والسقوط والسباحة والغوص وحماية التربة الزراعية
+        executeMove(client, player, level, nextTarget.x, nextTarget.y, nextTarget.z, allowSprint, isEating, maxTurnSpeed, rotateLook, protectFarmSoil);
         return NavResult.MOVING;
     }
 
-    private void updateStuckDetector(Minecraft client, LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode, Vec3 destination) {
+    private void updateStuckDetector(
+            Minecraft client,
+            LocalPlayer player,
+            ClientLevel level,
+            MultiPlayerGameMode gameMode,
+            Vec3 destination,
+            boolean protectFarmSoil,
+            boolean trackDoorForClosing) {
         if (stuckWindowAnchorPos == null) {
             stuckWindowAnchorPos = player.position();
             stuckWindowTicks = 0;
@@ -252,11 +356,13 @@ public class BotNavigator {
         }
 
         if (stuckStages >= 1) {
-            openDoorsAhead(player, level, gameMode, destination.x, destination.z);
+            openDoorsAhead(player, level, gameMode, destination.x, destination.z, trackDoorForClosing);
 
+            boolean soilProtected = protectFarmSoil
+                && (isStandingOnFarmSoil(player, level) || isStandingOnChest(player, level));
             boolean hasObs = isObstacleDirectlyAhead(player, level, destination.x, destination.z)
                 || hasStepDirectlyAhead(player, level, destination.x, destination.z);
-            if (player.onGround() && hasObs && isCeilingClear(level, player.blockPosition()) && jumpCooldown <= 0) {
+            if (!soilProtected && player.onGround() && hasObs && isCeilingClear(level, player.blockPosition()) && jumpCooldown <= 0) {
                 client.options.keyJump.setDown(true);
                 jumpCooldown = 12;
             }
@@ -321,7 +427,8 @@ public class BotNavigator {
             boolean sprint,
             boolean isEating,
             float maxTurnSpeed,
-            boolean rotateLook) {
+            boolean rotateLook,
+            boolean protectFarmSoil) {
         boolean inWater = isEntityInWater(level, player);
         boolean eyesInWater = isEyesInWater(level, player);
 
@@ -418,10 +525,12 @@ public class BotNavigator {
         client.options.keySprint.setDown(canSprint);
         player.setSprinting(canSprint);
 
+        boolean soilProtected = protectFarmSoil
+            && (isStandingOnFarmSoil(player, level) || isStandingOnChest(player, level));
         boolean isNodeUp = !currentPath.isEmpty() && (ty - player.getY() >= 0.62);
         boolean ceilingOk = isCeilingClear(level, player.blockPosition());
         boolean obstacleAhead = isObstacleDirectlyAhead(player, level, tx, tz) || hasStepDirectlyAhead(player, level, tx, tz);
-        boolean needsJump = (isNodeUp || obstacleAhead) && player.onGround() && ceilingOk && jumpCooldown <= 0;
+        boolean needsJump = !soilProtected && (isNodeUp || obstacleAhead) && player.onGround() && ceilingOk && jumpCooldown <= 0;
 
         if (needsJump) {
             client.options.keyJump.setDown(true);
@@ -432,10 +541,45 @@ public class BotNavigator {
     }
 
     /**
-     * فتح الأبواب وبوابات السياج المغلقة استباقياً في العقد القادمة أو أمام البوت مباشرة.
+     * التحقق من وقوف البوت فوق تربة زراعية أو رمال أرواح أو محصول لمنع إفسادها بالقفز.
      */
+    public static boolean isStandingOnFarmSoil(LocalPlayer player, ClientLevel level) {
+        if (player == null || level == null) return false;
+        BlockPos feet = player.blockPosition();
+        BlockState atFeet = level.getBlockState(feet);
+        BlockState belowFeet = level.getBlockState(feet.below());
+        return atFeet.is(Blocks.FARMLAND) || atFeet.is(Blocks.SOUL_SAND)
+            || belowFeet.is(Blocks.FARMLAND) || belowFeet.is(Blocks.SOUL_SAND)
+            || atFeet.getBlock() instanceof CropBlock
+            || belowFeet.getBlock() instanceof CropBlock
+            || atFeet.getBlock() instanceof NetherWartBlock
+            || belowFeet.getBlock() instanceof NetherWartBlock;
+    }
+
+    public static boolean isStandingOnChest(LocalPlayer player, ClientLevel level) {
+        if (player == null || level == null) return false;
+        BlockPos feet = player.blockPosition();
+        return FarmPathfinder.isChestOrContainer(level.getBlockState(feet))
+            || FarmPathfinder.isChestOrContainer(level.getBlockState(feet.below()));
+    }
+
     public void openDoorsAhead(LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode, double tx, double tz) {
+        openDoorsAhead(player, level, gameMode, tx, tz, false);
+    }
+
+    /**
+     * فتح الأبواب وبوابات السياج المغلقة استباقياً في العقد القادمة أو أمام البوت مباشرة، مع خيار تتبع العبور لإغلاقها بعد المرور.
+     */
+    public void openDoorsAhead(
+            LocalPlayer player,
+            ClientLevel level,
+            MultiPlayerGameMode gameMode,
+            double tx,
+            double tz,
+            boolean trackDoorForClosing) {
         if (player == null || level == null || gameMode == null || doorInteractCooldown > 0) return;
+
+        clearLastClosedDoorIfFar(player);
 
         // 1. فحص العقدتين القادمتين في مسار A*
         int checkNodes = Math.min(2, currentPath.size());
@@ -443,13 +587,13 @@ public class BotNavigator {
             BlockPos node = currentPath.get(i);
             for (int oy = 0; oy <= 1; oy++) {
                 BlockPos cand = node.above(oy);
-                if (tryInteractDoor(player, level, gameMode, cand, 2.6)) {
+                if (tryInteractDoor(player, level, gameMode, cand, 2.6, trackDoorForClosing)) {
                     return;
                 }
             }
         }
 
-        // 2. فحص مباشر أمام اتجاه الحركة (1.25 إلى 2.0 بلوكة)
+        // 2. فحص مباشر أمام اتجاه الحركة (0.85 إلى 1.85 بلوكة)
         double dx = tx - player.getX();
         double dz = tz - player.getZ();
         double len = Math.sqrt(dx * dx + dz * dz);
@@ -458,15 +602,194 @@ public class BotNavigator {
             double normZ = dz / len;
             for (double d = 0.85; d <= 1.85; d += 0.5) {
                 BlockPos pFeet = BlockPos.containing(player.getX() + normX * d, player.getY() + 0.2, player.getZ() + normZ * d);
-                if (tryInteractDoor(player, level, gameMode, pFeet, 2.6)
-                    || tryInteractDoor(player, level, gameMode, pFeet.above(), 2.6)) {
+                if (tryInteractDoor(player, level, gameMode, pFeet, 2.6, trackDoorForClosing)
+                    || tryInteractDoor(player, level, gameMode, pFeet.above(), 2.6, trackDoorForClosing)) {
                     return;
+                }
+            }
+        }
+
+        // 3. عند تفعيل الإغلاق التلقائي، تتبع الأبواب المفتوحة مسبقاً التي يعبرها البوت لإغلاقها خلفه
+        if (trackDoorForClosing && doorState == DoorHandlingState.NONE) {
+            BlockPos feet = player.blockPosition();
+            Vec3 look = player.getViewVector(1.0F);
+            double lookHorizLen = Math.sqrt(look.x * look.x + look.z * look.z);
+            for (int ox = -1; ox <= 1; ox++) {
+                for (int oz = -1; oz <= 1; oz++) {
+                    for (int oy = 0; oy <= 1; oy++) {
+                        BlockPos checkPos = feet.offset(ox, oy, oz);
+                        if (lastClosedDoorPos != null && checkPos.equals(lastClosedDoorPos)) {
+                            continue;
+                        }
+                        BlockState state = level.getBlockState(checkPos);
+                        boolean isOpenDoor = FarmPathfinder.isOpenableDoor(state) && state.getValue(DoorBlock.OPEN);
+                        boolean isOpenGate = FarmPathfinder.isOpenableGate(state) && state.getValue(FenceGateBlock.OPEN);
+                        if (!isOpenDoor && !isOpenGate) {
+                            continue;
+                        }
+                        double toDoorX = (checkPos.getX() + 0.5) - player.getX();
+                        double toDoorZ = (checkPos.getZ() + 0.5) - player.getZ();
+                        double hDist = Math.sqrt(toDoorX * toDoorX + toDoorZ * toDoorZ);
+                        if (hDist > 0.1 && lookHorizLen > 0.01) {
+                            double dot = (look.x * toDoorX + look.z * toDoorZ) / (lookHorizLen * hDist);
+                            if (dot < 0.2) {
+                                continue;
+                            }
+                        }
+                        if (player.distanceToSqr(checkPos.getX() + 0.5, checkPos.getY() + 0.5, checkPos.getZ() + 0.5) <= 1.25 * 1.25) {
+                            activeDoorPos = checkPos.immutable();
+                            activeDoorEntryPos = player.position();
+                            doorState = DoorHandlingState.STEPPING_THROUGH;
+                            doorStateTicks = 0;
+                            return;
+                        }
+                    }
                 }
             }
         }
     }
 
-    private boolean tryInteractDoor(LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode, BlockPos pos, double maxDist) {
+    private void clearLastClosedDoorIfFar(LocalPlayer player) {
+        if (lastClosedDoorPos == null || player == null) return;
+        double distSq = player.distanceToSqr(
+            lastClosedDoorPos.getX() + 0.5,
+            lastClosedDoorPos.getY() + 0.5,
+            lastClosedDoorPos.getZ() + 0.5
+        );
+        if (distSq > 4.5 * 4.5) {
+            lastClosedDoorPos = null;
+        }
+    }
+
+    private boolean isCompanionBlockingDoorClose(BlockPos doorPos, Vec3 entryPos, Vec3 companionPos) {
+        if (companionPos == null || doorPos == null) return false;
+        double doorX = doorPos.getX() + 0.5;
+        double doorZ = doorPos.getZ() + 0.5;
+        double cdx = companionPos.x - doorX;
+        double cdz = companionPos.z - doorZ;
+        double cDistSq = cdx * cdx + cdz * cdz;
+        if (cDistSq <= 2.3 * 2.3) {
+            return true;
+        }
+        if (entryPos != null && cDistSq <= 6.0 * 6.0) {
+            double entryX = doorX - entryPos.x;
+            double entryZ = doorZ - entryPos.z;
+            if (entryX * cdx + entryZ * cdz <= 0.15) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean handleDoorCycle(
+            Minecraft client,
+            LocalPlayer player,
+            ClientLevel level,
+            MultiPlayerGameMode gameMode,
+            Vec3 companionPos) {
+        clearLastClosedDoorIfFar(player);
+        if (doorState == DoorHandlingState.NONE || activeDoorPos == null) {
+            return false;
+        }
+
+        doorStateTicks++;
+        if (doorStateTicks > 80) {
+            resetDoorState(client);
+            return false;
+        }
+
+        BlockState state = level.getBlockState(activeDoorPos);
+        boolean isOpen = (FarmPathfinder.isOpenableDoor(state) && state.getValue(DoorBlock.OPEN))
+            || (FarmPathfinder.isOpenableGate(state) && state.getValue(FenceGateBlock.OPEN));
+
+        if (!isOpen && doorState != DoorHandlingState.CONFIRMING) {
+            resetDoorState(client);
+            return false;
+        }
+
+        double doorCenterX = activeDoorPos.getX() + 0.5;
+        double doorCenterY = activeDoorPos.getY() + 0.5;
+        double doorCenterZ = activeDoorPos.getZ() + 0.5;
+        double currX = player.getX() - doorCenterX;
+        double currZ = player.getZ() - doorCenterZ;
+        double hDist = Math.sqrt(currX * currX + currZ * currZ);
+
+        if (doorState == DoorHandlingState.STEPPING_THROUGH) {
+            if (activeDoorEntryPos == null) {
+                activeDoorEntryPos = player.position();
+            }
+            if (hDist > 4.2) {
+                resetDoorState(client);
+                return false;
+            }
+            double entryX = doorCenterX - activeDoorEntryPos.x;
+            double entryZ = doorCenterZ - activeDoorEntryPos.z;
+            double crossDot = entryX * currX + entryZ * currZ;
+
+            if (crossDot > 0.05 && hDist >= 1.35) {
+                if (isCompanionBlockingDoorClose(activeDoorPos, activeDoorEntryPos, companionPos)) {
+                    lastClosedDoorPos = activeDoorPos;
+                    resetDoorState(client);
+                    return false;
+                }
+                BotEquipmentHelper.releaseMovementKeys(client);
+                doorState = DoorHandlingState.TURNING_AND_CLOSING;
+                doorStateTicks = 0;
+                return true;
+            }
+            return false;
+        }
+
+        if (doorState == DoorHandlingState.TURNING_AND_CLOSING) {
+            if (player.isUsingItem() || gameMode == null
+                    || isCompanionBlockingDoorClose(activeDoorPos, activeDoorEntryPos, companionPos)) {
+                resetDoorState(client);
+                return false;
+            }
+
+            BotEquipmentHelper.releaseMovementKeys(client);
+            BotEquipmentHelper.smoothLookAt(player, doorCenterX, doorCenterY, doorCenterZ, 180.0f);
+
+            if (isOpen) {
+                int safeSlot = BotEquipmentHelper.findSafeInteractionSlot(player);
+                if (safeSlot != -1 && safeSlot != player.getInventory().getSelectedSlot()) {
+                    BotEquipmentHelper.selectHotbarSlot(player, safeSlot);
+                }
+                BlockHitResult hit = new BlockHitResult(Vec3.atCenterOf(activeDoorPos), Direction.UP, activeDoorPos, false);
+                gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
+                player.swing(InteractionHand.MAIN_HAND);
+            }
+
+            doorState = DoorHandlingState.CONFIRMING;
+            doorConfirmTicks = 3;
+            return true;
+        }
+
+        if (doorState == DoorHandlingState.CONFIRMING) {
+            BotEquipmentHelper.releaseMovementKeys(client);
+            if (doorConfirmTicks > 0) {
+                doorConfirmTicks--;
+                return true;
+            }
+            doorInteractCooldown = 15;
+            lastClosedDoorPos = activeDoorPos;
+            resetDoorState(client);
+            return false;
+        }
+
+        return false;
+    }
+
+    private boolean tryInteractDoor(
+            LocalPlayer player,
+            ClientLevel level,
+            MultiPlayerGameMode gameMode,
+            BlockPos pos,
+            double maxDist,
+            boolean trackDoorForClosing) {
+        if (lastClosedDoorPos != null && pos.equals(lastClosedDoorPos)) {
+            return false;
+        }
         if (player.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5) > maxDist * maxDist) {
             return false;
         }
@@ -474,10 +797,22 @@ public class BotNavigator {
         boolean isDoor = FarmPathfinder.isOpenableDoor(st) && !st.getValue(DoorBlock.OPEN);
         boolean isGate = FarmPathfinder.isOpenableGate(st) && !st.getValue(FenceGateBlock.OPEN);
         if (isDoor || isGate) {
+            if (!player.isUsingItem()) {
+                int safeSlot = BotEquipmentHelper.findSafeInteractionSlot(player);
+                if (safeSlot != -1 && safeSlot != player.getInventory().getSelectedSlot()) {
+                    BotEquipmentHelper.selectHotbarSlot(player, safeSlot);
+                }
+            }
             BlockHitResult hit = new BlockHitResult(Vec3.atCenterOf(pos), Direction.UP, pos, false);
             gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
             player.swing(InteractionHand.MAIN_HAND);
             doorInteractCooldown = 8;
+            if (trackDoorForClosing && doorState == DoorHandlingState.NONE) {
+                activeDoorPos = pos.immutable();
+                activeDoorEntryPos = player.position();
+                doorState = DoorHandlingState.STEPPING_THROUGH;
+                doorStateTicks = 0;
+            }
             return true;
         }
         return false;

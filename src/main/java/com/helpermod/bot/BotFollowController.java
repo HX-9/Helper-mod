@@ -208,6 +208,10 @@ public class BotFollowController {
      */
     public void onTick(Minecraft client) {
         if (!following || client == null) return;
+        if (client.isPaused()) {
+            releaseMovement(client);
+            return;
+        }
 
         LocalPlayer player = client.player;
         ClientLevel level = client.level;
@@ -303,15 +307,6 @@ public class BotFollowController {
         }
 
         // ==============================================================
-        // الأولوية 0: حراسة التنفس الطارئة في الماء (الطفو أو الهروب من السقف قبل الغرق مع السماح بالغوص الحر)
-        // ==============================================================
-        if (navigator.handleUrgentWaterBreathing(client, player, level, gameMode)) {
-            stopFollowEating(client, player, gameMode);
-            navigator.clearPathOnly();
-            return;
-        }
-
-        // ==============================================================
         // الأولوية 1: القتال والدفاع التكتيكي الحاسم (Combat & Defense)
         // ==============================================================
         boolean engagedInCombat = BotCombatManager.getInstance().tickCombat(client, player, level, gameMode, companion, dist3D);
@@ -326,6 +321,28 @@ public class BotFollowController {
         // ==============================================================
         if (companionSleeping && sleepReenterCooldown <= 0
             && handleSleepWithCompanion(client, player, level, gameMode, companion)) {
+            return;
+        }
+
+        // إكمال دورة إغلاق الباب الجارية خلف البوت بأمان قبل التوقف بجوار القائد
+        if (navigator.isBusyClosingDoor()) {
+            navigator.navigateTo(
+                client,
+                player,
+                level,
+                gameMode,
+                companion.position(),
+                false,
+                2.5,
+                isEatingWhileFollowing,
+                45.0f,
+                true,
+                4000,
+                FarmPathfinder.PathOptions.COMBAT_FOLLOW,
+                false,
+                true,
+                companion.position()
+            );
             return;
         }
 
@@ -381,7 +398,10 @@ public class BotFollowController {
                 }
 
                 Vec3 targetPos = companion.position();
-                navigator.navigateTo(client, player, level, gameMode, targetPos, true, 2.5, isEatingWhileFollowing, 45.0f, true, 4000);
+                navigator.navigateTo(
+                    client, player, level, gameMode, targetPos, true, 2.5, isEatingWhileFollowing, 45.0f, true, 4000,
+                    FarmPathfinder.PathOptions.COMBAT_FOLLOW, false, true, companion.position()
+                );
                 break;
             }
 
@@ -412,7 +432,11 @@ public class BotFollowController {
                 if (verticalGap > waterAwareGapLimit) {
                     Vec3 climbTarget = distXZ <= 3.2 ? companion.position() : calculateFlexibleEscortPos(player, companion, level);
                     boolean sprint = dist3D > 4.5;
-                    navigator.navigateTo(client, player, level, gameMode, climbTarget, sprint, distXZ <= 3.2 ? (inWater ? 0.9 : 2.0) : 0.8, isEatingWhileFollowing, 45.0f, true, 4000);
+                    navigator.navigateTo(
+                        client, player, level, gameMode, climbTarget, sprint,
+                        distXZ <= 3.2 ? (inWater ? 0.9 : 2.0) : 0.8, isEatingWhileFollowing, 45.0f, true, 4000,
+                        FarmPathfinder.PathOptions.COMBAT_FOLLOW, false, true, companion.position()
+                    );
                 } else if (distXZ < 2.2) {
                     releaseMovement(client);
                     BotNavigator.maintainWaterBuoyancy(client, player, level, companion);
@@ -420,7 +444,10 @@ public class BotFollowController {
                 } else if (distXZ > 3.2) {
                     Vec3 escortTarget = calculateFlexibleEscortPos(player, companion, level);
                     boolean sprint = distXZ > 4.5;
-                    navigator.navigateTo(client, player, level, gameMode, escortTarget, sprint, 0.7, isEatingWhileFollowing, 45.0f, true, 4000);
+                    navigator.navigateTo(
+                        client, player, level, gameMode, escortTarget, sprint, 0.7, isEatingWhileFollowing, 45.0f, true, 4000,
+                        FarmPathfinder.PathOptions.COMBAT_FOLLOW, false, true, companion.position()
+                    );
                 } else {
                     releaseMovement(client);
                     BotNavigator.maintainWaterBuoyancy(client, player, level, companion);
@@ -812,6 +839,9 @@ public class BotFollowController {
             ClientLevel level,
             MultiPlayerGameMode gameMode,
             Player companion) {
+        if (!FarmAreaManager.isBedDimensionSupported(level)) {
+            return false;
+        }
         if (player.isSleeping()) {
             sleepingWithCompanion = true;
             targetSleepBedPos = null;
@@ -870,7 +900,11 @@ public class BotFollowController {
                 false,
                 45.0f,
                 true,
-                3500
+                3500,
+                FarmPathfinder.PathOptions.COMBAT_FOLLOW,
+                false,
+                true,
+                companion.position()
             );
             if (navRes == BotNavigator.NavResult.BLOCKED_UNREACHABLE
                 || (navRes == BotNavigator.NavResult.ARRIVED && !hasClearView)) {

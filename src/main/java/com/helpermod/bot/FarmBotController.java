@@ -22,6 +22,7 @@ import net.minecraft.world.item.Item;
 import net.minecraft.world.item.Items;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.block.BedBlock;
+import net.minecraft.world.level.block.state.properties.BedPart;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.ComposterBlock;
 import net.minecraft.world.level.block.CropBlock;
@@ -34,6 +35,7 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -48,24 +50,8 @@ public class FarmBotController {
     private boolean running = false;
     private boolean isDriving = false;
     private int cooldownTicks = 0;
-    private int stuckTicks = 0;
     private int hoeAlertTicks = 0;
-    private int doorInteractCooldown = 0;
-
-    // تتبع حالة فتح وعبور وإغلاق الأبواب وبوابات السياج (التوقف والالتفاف والإغلاق ثم المتابعة)
-    private enum DoorHandlingState {
-        NONE,
-        STEPPING_THROUGH,
-        TURNING_AND_CLOSING,
-        CONFIRMING
-    }
-
-    private BlockPos activeDoorPos = null;
-    private Vec3 activeDoorEntryPos = null;
-    private DoorHandlingState doorState = DoorHandlingState.NONE;
-    private int doorStateTicks = 0;
-    private int doorConfirmTicks = 0;
-    private BlockPos lastClosedDoorPos = null;
+    private int sleepDoorCooldown = 0;
 
     // تتبع حالة المناورة والهروب التكتيكي بالدرع عند وجود تهديد
     private boolean isEvadingThreat = false;
@@ -95,11 +81,11 @@ public class FarmBotController {
         return isEvadingThreat;
     }
 
-    // مسار التحرك الذكي لتفادي الأسوار والجدران
-    private List<BlockPos> currentPath = null;
-    private final BotNavigator waterRescueNavigator = new BotNavigator();
-    private BlockPos currentGoal = null;
-    private int pathRecalcCooldown = 0;
+    // الملاحة الموحدة عبر BotNavigator وتتبّع سياق العالم والبُعد الحالي
+    private final BotNavigator farmNavigator = new BotNavigator();
+    private BlockPos trackedGoalPos = null;
+    private String lastContextSignature = null;
+    private boolean dimensionSleepNoticeSent = false;
 
     // سرعة دوران الكاميرا السلسة والمتجاوبة أثناء الزراعة (درجات في كل نبضة/tick)
     // أبطأ وأسلس من وضع الدفاع لتجنب الالتفاف المتشنج فوق التربة الزراعية
@@ -150,16 +136,19 @@ public class FarmBotController {
     private int nightTicks = 0;
     private boolean bedAlertSent = false;
 
-    // تتبع تفريغ المحاصيل في الصندوق
+    // تتبع تفريغ المحاصيل والبذور الفائضة في الصناديق (يدعم تعدد الصناديق وفصل البذور عن المحصول)
     private FarmArea targetDepositArea = null;
+    private BlockPos targetDepositChestPos = null;
+    private FarmArea.ChestRole targetDepositRole = FarmArea.ChestRole.CROP;
     private int depositTimeoutTicks = 0;
     private final Set<BlockPos> visitedDepositChests = new HashSet<>();
-    private final Set<FarmCrop> lastDepositTargetCrops = EnumSet.noneOf(FarmCrop.class);
-    private final Set<FarmCrop> lastDepositExcludedCrops = EnumSet.noneOf(FarmCrop.class);
-    private boolean lastDepositAllowUnmappedFarmItems = false;
+    private DepositPlan activeDepositPlan = null;
+    private final Set<FarmCrop> attemptedOutputChestsCrops = EnumSet.noneOf(FarmCrop.class);
+    private final Set<FarmCrop> attemptedSeedChestsCrops = EnumSet.noneOf(FarmCrop.class);
 
-    // تتبع تحويل الفائض لسماد في الكومبوستر عند امتلاء الصناديق
-    private final Set<FarmCrop> fullChestCrops = new HashSet<>();
+    // تتبع تحويل الفائض لسماد في الكومبوستر عند امتلاء الصناديق المخصصة له
+    private final Set<FarmCrop> fullOutputChestCrops = EnumSet.noneOf(FarmCrop.class);
+    private final Set<FarmCrop> fullSeedChestCrops = EnumSet.noneOf(FarmCrop.class);
     private BlockPos targetComposterPos = null;
     private int compostTimeoutTicks = 0;
     private int compostActionCooldown = 0;
@@ -172,6 +161,8 @@ public class FarmBotController {
     // تتبع سحب البذور من الصندوق عند نفادها من الحقيبة
     private FarmArea targetWithdrawArea = null;
     private FarmCrop targetWithdrawCrop = null;
+    private BlockPos targetWithdrawChestPos = null;
+    private final Set<BlockPos> visitedWithdrawChests = new HashSet<>();
     private int withdrawTimeoutTicks = 0;
     private final Set<String> areasOutOfSeeds = new HashSet<>();
 
@@ -232,30 +223,26 @@ public class FarmBotController {
             sendChatMessage(client, "§e[Bot] المساعد الآلي يعمل بالفعل!");
             return;
         }
+        String contextSig = buildContextSignature(client);
         List<FarmArea> areas = FarmAreaManager.getInstance().getActiveAreas();
         if (areas.isEmpty()) {
             if (FarmAreaManager.getInstance().getAllAreas().isEmpty()) {
-                sendChatMessage(client, "§c[Bot] لا توجد مناطق زراعية محددة! أضف منطقة أولاً باستخدام: /bot farm area pos1 ثم pos2 ثم create <اسم>");
+                sendChatMessage(client, "§c[Bot] لا توجد مناطق زراعية محددة في هذا العالم/البُعد! أضف منطقة أولاً باستخدام: /bot farm area pos1 ثم pos2 ثم create <اسم>");
             } else {
-                sendChatMessage(client, "§c[Bot] جميع المزارع المسجلة حالياً غير مفعلة! فعّل مزرعة أو الكل عبر: §e/bot farm area enable <الاسم|all>");
+                sendChatMessage(client, "§c[Bot] جميع المزارع المسجلة في هذا البُعد غير مفعلة حالياً! فعّل مزرعة أو الكل عبر: §e/bot farm area enable <الاسم|all>");
             }
             return;
         }
         running = true;
+        lastContextSignature = contextSig;
         // إيقاف وضع الاتباع تلقائياً لمنع أي تعارض حركي
         if (BotFollowController.getInstance().isFollowing()) {
             BotFollowController.getInstance().stopFollowing(client);
         }
-        fullChestPausedFarms.clear();
-        visitedDepositChests.clear();
-        lastDepositTargetCrops.clear();
-        lastDepositExcludedCrops.clear();
-        lastDepositAllowUnmappedFarmItems = false;
-        depositCloseDelay = 0;
-        withdrawCloseDelay = 0;
+        resetChestWorkflowState(true);
         isDriving = false;
         cooldownTicks = 0;
-        stuckTicks = 0;
+        sleepDoorCooldown = 0;
         currentAreaIndex = 0;
         currentStage = FarmStage.HARVEST;
         actionsInCurrentFarm = 0;
@@ -270,29 +257,24 @@ public class FarmBotController {
         eatingTicks = 0;
         lastFoodLevel = -1;
         hungryAlertCooldown = 0;
-        currentPath = null;
-        currentGoal = null;
         nightTicks = 0;
         bedAlertSent = false;
-        targetDepositArea = null;
-        depositTimeoutTicks = 0;
-        targetWithdrawArea = null;
-        targetWithdrawCrop = null;
-        withdrawTimeoutTicks = 0;
-        areasOutOfSeeds.clear();
-        resetDoorState(client);
+        dimensionSleepNoticeSent = false;
+        farmNavigator.reset(client);
+        trackedGoalPos = null;
         waitingAlertTicks = 1100;
         lastPlayerPos = null;
         physicalStuckTicks = 0;
         doingFinalVerification = false;
         finalVerificationTicks = 0;
-        // وضع الفأس الزراعي في اليد اليسرى فور تشغيل البوت
-        if (client.player != null && client.gameMode != null) {
+        FightBotController.getInstance().resetFarmCombat(client);
+        // وضع الفأس الزراعي في اليد اليسرى فور تشغيل البوت (إلا إذا كان التوتم مطلوباً لحالة صحية حرجة)
+        if (client.player != null && client.gameMode != null && !BotEquipmentHelper.isCriticalHealthForTotem(client.player)) {
             FightBotController.getInstance().ensureHoeInOffhand(client, client.player, client.gameMode);
         }
 
-        // فحص هل الوقت ليل عند بدء/العودة لوضع الزراعة للتفكير بالنوم فوراً
-        if (client.level != null) {
+        // فحص هل الوقت ليل عند بدء/العودة لوضع الزراعة للتفكير بالنوم فوراً (في الأبعاد التي تدعم الأسرة فقط)
+        if (client.level != null && FarmAreaManager.isBedDimensionSupported(client.level)) {
             boolean isNightNow = client.level.isThundering() || (client.level.getSkyDarken() >= 4);
             if (isNightNow && FarmAreaManager.getInstance().isSleepAtNight()) {
                 nightTicks = 400; // ضبط العداد على 20 ثانية للتفكير بالنوم والتوجه للسرير فوراً
@@ -314,8 +296,10 @@ public class FarmBotController {
             return;
         }
         running = false;
-        currentPath = null;
-        currentGoal = null;
+        lastContextSignature = null;
+        trackedGoalPos = null;
+        sleepDoorCooldown = 0;
+        dimensionSleepNoticeSent = false;
         lockedItem = null;
         itemStuckTicks = 0;
         ignoredItemIds.clear();
@@ -328,26 +312,7 @@ public class FarmBotController {
         hungryAlertCooldown = 0;
         nightTicks = 0;
         bedAlertSent = false;
-        targetDepositArea = null;
-        depositTimeoutTicks = 0;
-        visitedDepositChests.clear();
-        lastDepositTargetCrops.clear();
-        lastDepositExcludedCrops.clear();
-        lastDepositAllowUnmappedFarmItems = false;
-        targetWithdrawArea = null;
-        targetWithdrawCrop = null;
-        withdrawTimeoutTicks = 0;
-        areasOutOfSeeds.clear();
-        fullChestCrops.clear();
-        fullChestPausedFarms.clear();
-        depositCloseDelay = 0;
-        withdrawCloseDelay = 0;
-        targetComposterPos = null;
-        compostTimeoutTicks = 0;
-        compostActionCooldown = 0;
-        collectBoneMealTicks = 0;
-        fertilizerTimeoutTicks = 0;
-        resetDoorState(client);
+        resetChestWorkflowState(true);
         isEvadingThreat = false;
         isRetreatingInFarm = false;
         isEmergencyRunningFarm = false;
@@ -361,14 +326,122 @@ public class FarmBotController {
         waitingAlertTicks = 0;
         lastPlayerPos = null;
         physicalStuckTicks = 0;
+        FightBotController.getInstance().resetFarmCombat(client);
         FightBotController.getInstance().stopDefending(client);
         FightBotController.getInstance().releaseEmergencyRun(client);
-        waterRescueNavigator.reset(client);
+        farmNavigator.reset(client);
         if (isDriving) {
             releaseControls(client);
             isDriving = false;
         }
         sendChatMessage(client, "§c[Bot] تم إيقاف المساعد الآلي وإنهاء التحكم باللاعب بالكامل. (الحالة: متوقف)");
+    }
+
+    private void resetChestWorkflowState(boolean clearPausedFarms) {
+        targetDepositArea = null;
+        targetDepositChestPos = null;
+        targetDepositRole = FarmArea.ChestRole.CROP;
+        depositTimeoutTicks = 0;
+        depositCloseDelay = 0;
+        visitedDepositChests.clear();
+        activeDepositPlan = null;
+        attemptedOutputChestsCrops.clear();
+        attemptedSeedChestsCrops.clear();
+        fullOutputChestCrops.clear();
+        fullSeedChestCrops.clear();
+        targetWithdrawArea = null;
+        targetWithdrawCrop = null;
+        targetWithdrawChestPos = null;
+        visitedWithdrawChests.clear();
+        withdrawTimeoutTicks = 0;
+        withdrawCloseDelay = 0;
+        areasOutOfSeeds.clear();
+        targetComposterPos = null;
+        compostTimeoutTicks = 0;
+        compostActionCooldown = 0;
+        collectBoneMealTicks = 0;
+        fertilizerTimeoutTicks = 0;
+        if (clearPausedFarms) {
+            fullChestPausedFarms.clear();
+        }
+    }
+
+    private void resetNavPath() {
+        farmNavigator.clearPathOnly();
+        trackedGoalPos = null;
+    }
+
+    private String buildContextSignature(Minecraft client) {
+        FarmAreaManager manager = FarmAreaManager.getInstance();
+        manager.updateContext(client);
+        return manager.getCurrentWorldKey() + "|" + manager.getCurrentDimensionId();
+    }
+
+    private boolean resetSessionProgressOnContextChange(Minecraft client) {
+        LocalPlayer player = client != null ? client.player : null;
+        if (player != null && player.containerMenu != null && player.containerMenu != player.inventoryMenu) {
+            player.closeContainer();
+        }
+        if (isEating && client != null && client.options != null) {
+            client.options.keyUse.setDown(false);
+        }
+        isEating = false;
+        eatingTicks = 0;
+        lastFoodLevel = -1;
+
+        farmNavigator.reset(client);
+        trackedGoalPos = null;
+        cooldownTicks = 0;
+        sleepDoorCooldown = 0;
+        lockedItem = null;
+        itemStuckTicks = 0;
+        ignoredItemIds.clear();
+        unreachablePositions.clear();
+        lastTargetPos = null;
+        targetStuckTicks = 0;
+        lastPlayerPos = null;
+        physicalStuckTicks = 0;
+        resetChestWorkflowState(true);
+        currentAreaIndex = 0;
+        currentStage = FarmStage.HARVEST;
+        actionsInCurrentFarm = 0;
+        consecutiveEmptyFarms = 0;
+        doingFinalVerification = false;
+        finalVerificationTicks = 0;
+        nightTicks = 0;
+        bedAlertSent = false;
+        dimensionSleepNoticeSent = false;
+
+        FightBotController fightCtrl = FightBotController.getInstance();
+        fightCtrl.resetFarmCombat(client);
+        fightCtrl.stopDefending(client);
+        fightCtrl.releaseRetreatMovement(client);
+        fightCtrl.releaseEmergencyRun(client);
+        isEvadingThreat = false;
+        isRetreatingInFarm = false;
+        isEmergencyRunningFarm = false;
+        emergencyRunStartPosFarm = null;
+        emergencyRunDirFarm = null;
+        emergencyRunTicksFarm = 0;
+        evadeTicks = 0;
+        noThreatTicks = 0;
+
+        if (isDriving) {
+            releaseControls(client);
+            isDriving = false;
+        }
+
+        FarmAreaManager manager = FarmAreaManager.getInstance();
+        List<FarmArea> newAreas = manager.getActiveAreas();
+        if (newAreas.isEmpty()) {
+            sendChatMessage(client, "§e[Bot] تم الانتقال إلى §b" + manager.getCurrentDimensionDisplayName() + "§e ولا توجد مزارع مفعلة في هذا البُعد؛ تم إيقاف وضع الزراعة.");
+            stop(client);
+            return false;
+        }
+
+        sendChatMessage(client, "§b[Bot] تم تبديل سياق الزراعة تلقائياً إلى: §e" + manager.getCurrentDimensionDisplayName());
+        cooldownTicks = 10;
+        return true;
     }
 
     public void onTick(Minecraft client) {
@@ -387,39 +460,110 @@ public class FarmBotController {
         MultiPlayerGameMode gameMode = client.gameMode;
 
         if (player == null || level == null || gameMode == null || player.isDeadOrDying()) {
-            waterRescueNavigator.reset(client);
+            farmNavigator.reset(client);
+            trackedGoalPos = null;
             return;
         }
 
-        waterRescueNavigator.tickCooldowns();
+        // تحديث سياق العالم والبُعد ومعالجة الانتقال بين الأبعاد فورياً
+        String contextSig = buildContextSignature(client);
+        if (lastContextSignature == null) {
+            lastContextSignature = contextSig;
+        } else if (!lastContextSignature.equals(contextSig)) {
+            lastContextSignature = contextSig;
+            if (!resetSessionProgressOnContextChange(client)) {
+                return;
+            }
+        }
+
+        farmNavigator.tickCooldowns();
+        if (sleepDoorCooldown > 0) {
+            sleepDoorCooldown--;
+        }
 
         // حراسة التنفس الطارئة في الماء (الطفو أو الهروب من السقف قبل الغرق مع السماح بالغوص الحر)
         if (!player.isSleeping() || BotNavigator.isEyesInWater(level, player)) {
             if (player.isSleeping() && BotNavigator.isEyesInWater(level, player) && BotNavigator.getAirRatio(player) <= 0.35) {
                 player.stopSleepInBed(true, true);
             }
-            if (!player.isSleeping() && waterRescueNavigator.handleUrgentWaterBreathing(client, player, level, gameMode)) {
+            if (!player.isSleeping() && farmNavigator.handleUrgentWaterBreathing(client, player, level, gameMode)) {
                 isDriving = true;
                 return;
             }
         }
 
-        // أولاً وقبل أي مهمة أو كولداون أو عمل زراعي: فحص وضع الدفاع ورصد أي تهديد للصد الفوري والمناورة
-        if (FightBotController.getInstance().isDefenseMode()) {
-            FightBotController.ThreatInfo threat = FightBotController.getInstance().detectThreat(player, level);
+        // أولاً وقبل أي مهمة أو كولداون أو عمل زراعي: معالجة الدفاع أو القتال الفعلي وفق النمط المختار
+        FightBotController fightCtrl = FightBotController.getInstance();
+        FightBotController.DefenseMode defenseMode = fightCtrl.getDefenseMode();
+        if (defenseMode == FightBotController.DefenseMode.COMBAT) {
+            if (isEvadingThreat) {
+                isEvadingThreat = false;
+                isRetreatingInFarm = false;
+                isEmergencyRunningFarm = false;
+                emergencyRunStartPosFarm = null;
+                emergencyRunDirFarm = null;
+                emergencyRunTicksFarm = 0;
+                evadeTicks = 0;
+                noThreatTicks = 0;
+                fightCtrl.releaseRetreatMovement(client);
+                fightCtrl.releaseEmergencyRun(client);
+            }
+            if (fightCtrl.tickFarmCombat(client, player, level, gameMode)) {
+                if (isEating) {
+                    client.options.keyUse.setDown(false);
+                    isEating = false;
+                    eatingTicks = 0;
+                    lastFoodLevel = -1;
+                }
+                cooldownTicks = 0;
+                resetNavPath();
+                isDriving = false;
+                return;
+            }
+        } else if (defenseMode == FightBotController.DefenseMode.CAUTIOUS) {
+            if (fightCtrl.isInFarmCombat()) {
+                fightCtrl.resetFarmCombat(client);
+            }
+            FightBotController.ThreatInfo threat = fightCtrl.detectThreat(player, level);
             if (threat != null || isEvadingThreat) {
                 handleThreatEvadeAndEscape(client, player, level, gameMode, threat);
                 return;
             }
+        } else {
+            if (fightCtrl.isInFarmCombat()) {
+                fightCtrl.resetFarmCombat(client);
+            }
         }
 
-        // التأكد دائماً من وجود الفأس الزراعي في اليد اليسرى (Offhand) طالما لا يوجد خطر دفاعي
-        if (!FightBotController.getInstance().isDefending() && !isEvadingThreat) {
-            FightBotController.getInstance().ensureHoeInOffhand(client, player, gameMode);
+        // التأكد دائماً من وجود الفأس الزراعي في اليد اليسرى (Offhand) طالما لا يوجد خطر قتالي ولا أزمة توتم
+        if (!fightCtrl.isDefending() && !fightCtrl.isInFarmCombat() && !isEvadingThreat
+                && !BotEquipmentHelper.isCriticalHealthForTotem(player)) {
+            fightCtrl.ensureHoeInOffhand(client, player, gameMode);
         }
 
-        if (doorInteractCooldown > 0) {
-            doorInteractCooldown--;
+        // إكمال دورة إغلاق الباب الجارية عبر الملاحة الموحدة قبل مواصلة الزراعة أو التفاعل
+        boolean hasOpenContainer = player.containerMenu != null && player.containerMenu != player.inventoryMenu;
+        if (!player.isSleeping() && !hasOpenContainer && farmNavigator.isBusyClosingDoor()) {
+            BlockPos fallbackGoal = trackedGoalPos != null ? trackedGoalPos : player.blockPosition();
+            farmNavigator.navigateTo(
+                client,
+                player,
+                level,
+                gameMode,
+                Vec3.atBottomCenterOf(fallbackGoal),
+                false,
+                0.5,
+                isEating,
+                ROTATION_SPEED,
+                true,
+                4000,
+                FarmPathfinder.PathOptions.FARM_DEFAULT,
+                true,
+                true,
+                null
+            );
+            isDriving = true;
+            return;
         }
 
         if (cooldownTicks > 0) {
@@ -437,31 +581,29 @@ public class FarmBotController {
             hungryAlertCooldown--;
         }
 
-        // التعامل مع إغلاق الأبواب بعد العبور (التوقف التام والالتفاف وإغلاق الباب ثم مواصلة الطريق)
-        if (handleDoorState(client, player, level, gameMode)) {
-            return;
-        }
+        boolean canSleepInDimension = FarmAreaManager.isBedDimensionSupported(level);
 
-        // مراقبة الليل وشروق الشمس بدقة (الظلام أو العواصف الرعدية)
-        boolean isNightTime = level.isThundering() || (level.getSkyDarken() >= 4);
+        // مراقبة الليل وشروق الشمس بدقة (في الأبعاد التي تدعم الأسرة فقط)
+        boolean isNightTime = canSleepInDimension && (level.isThundering() || (level.getSkyDarken() >= 4));
         if (isNightTime) {
             nightTicks++;
         } else {
             nightTicks = 0;
             bedAlertSent = false;
-            // الاستيقاظ التلقائي فور شروق الشمس وانتهاء الليل
+            // الاستيقاظ التلقائي فور شروق الشمس أو الخروج من بعد يدعم النوم
             if (currentStage == FarmStage.SLEEP) {
                 if (player.isSleeping()) {
                     player.stopSleepInBed(true, true);
                 }
-                sendChatMessage(client, "§a[Bot] صباح الخير! أشرقت الشمس واستيقظ البوت، يستأنف الآن دورة العمل في المزارع...");
+                if (canSleepInDimension) {
+                    sendChatMessage(client, "§a[Bot] صباح الخير! أشرقت الشمس واستيقظ البوت، يستأنف الآن دورة العمل في المزارع...");
+                }
                 currentStage = FarmStage.HARVEST;
                 actionsInCurrentFarm = 0;
                 consecutiveEmptyFarms = 0;
                 unreachablePositions.clear();
                 areasOutOfSeeds.clear();
-                currentPath = null;
-                currentGoal = null;
+                resetNavPath();
                 lastTargetPos = null;
                 targetStuckTicks = 0;
                 physicalStuckTicks = 0;
@@ -481,11 +623,13 @@ public class FarmBotController {
                 releaseControls(client);
                 isDriving = false;
             }
-            player.getSleepingPos().ifPresent(pos -> {
-                if (FarmAreaManager.getInstance().getBedPos() == null) {
-                    FarmAreaManager.getInstance().setBedPos(pos);
-                }
-            });
+            if (canSleepInDimension) {
+                player.getSleepingPos().ifPresent(pos -> {
+                    if (FarmAreaManager.getInstance().getBedPos() == null) {
+                        FarmAreaManager.getInstance().setBedPos(pos);
+                    }
+                });
+            }
             // طالما أن الليل مستمر، ننتظر بهدوء حتى الصباح
             if (isNightTime) {
                 return;
@@ -514,11 +658,10 @@ public class FarmBotController {
         }
 
         // التفكير في النوم فوراً والعودة للسرير بعد مرور 20 ثانية على الليل (400 tick)
-        if (FarmAreaManager.getInstance().isSleepAtNight() && isNightTime && nightTicks >= 400) {
+        if (canSleepInDimension && FarmAreaManager.getInstance().isSleepAtNight() && isNightTime && nightTicks >= 400) {
             sendChatMessage(client, "§e[Bot] مر على الليل 20 ثانية! يتوجه البوت فوراً للسرير للنوم حتى تطلع الشمس...");
             currentStage = FarmStage.SLEEP;
-            currentPath = null;
-            currentGoal = null;
+            resetNavPath();
             if (isDriving) {
                 releaseControls(client);
                 isDriving = false;
@@ -558,8 +701,7 @@ public class FarmBotController {
                 sendChatMessage(client, "§e[Bot] تم جمع ستاك كامل (64) من السماد! يتوجه البوت الآن لتفريغه في صندوق السماد...");
                 currentStage = FarmStage.DEPOSIT_FERTILIZER;
                 fertilizerTimeoutTicks = 0;
-                currentPath = null;
-                currentGoal = null;
+                resetNavPath();
                 if (isDriving) {
                     releaseControls(client);
                     isDriving = false;
@@ -665,15 +807,7 @@ public class FarmBotController {
                             if (itemStuckTicks > 40) { // انتظار لثانيتين لالتقاطه (أو تفريغه إن كانت الحقيبة ممتلئة تماماً)
                                 if (isInventoryFull(player)) {
                                     List<FarmArea> activeAreas = FarmAreaManager.getInstance().getActiveAreas();
-                                    visitedDepositChests.clear();
-                                    FarmArea depositFarm = findAreaNeedingDeposit(player, level, activeAreas);
-                                    if (depositFarm != null) {
-                                        sendChatMessage(client, "§e[Bot] المخزون ممتلئ أثناء تجميع المحاصيل! يتوجه لتفريغ المحاصيل بدءاً بصندوق مزرعة §a" + depositFarm.getName() + "§e مع الاحتفاظ بـ 64 بذرة...");
-                                        targetDepositArea = depositFarm;
-                                        currentStage = FarmStage.DEPOSIT;
-                                        currentPath = null;
-                                        currentGoal = null;
-                                        depositTimeoutTicks = 0;
+                                    if (tryStartDepositCycle(client, player, level, activeAreas, "المخزون ممتلئ أثناء تجميع المحاصيل")) {
                                         itemStuckTicks = 0;
                                         lockedItem = null;
                                         return;
@@ -699,8 +833,7 @@ public class FarmBotController {
                                 return;
                             }
                             // تحديد أقرب بلوكة مجاورة سالكة في المزرعة للتحرك نحوها عبر البوابة
-                            BlockPos navTarget = getBestNavTargetForItem(level, player.blockPosition(), lockedItem);
-                            navigateTowards(client, player, level, navTarget, lockedItem.getX(), lockedItem.getY(), lockedItem.getZ(), isItemAtFence ? 1.0 : 0.65);
+                            navigateTowardsCollectedItem(client, player, level, lockedItem, isItemAtFence);
                             return;
                         }
 
@@ -713,15 +846,14 @@ public class FarmBotController {
                             return;
                         }
 
-                        // التوجه المباشر إذا كان العنصر قريباً وفي نفس الارتفاع ولا يقع في بلوكة سور صلبة
+                        // التوجه المباشر الآمن إذا كان العنصر قريباً وفي نفس الارتفاع ولا يقع في بلوكة سور صلبة
                         if (!isItemAtFence && hDistSq <= 3.5 * 3.5 && Math.abs(dy) <= 1.5) {
-                            moveTo(client, player, level, lockedItem.getX(), lockedItem.getY(), lockedItem.getZ(), 0.5);
+                            navigateTowards(client, player, level, lockedItem.blockPosition(), lockedItem.getX(), lockedItem.getY(), lockedItem.getZ(), 0.5);
                             return;
                         }
 
                         // التنقل الذكي إلى أقرب بلوكة ملاصقة للسور أو للمحصول
-                        BlockPos navTarget = getBestNavTargetForItem(level, player.blockPosition(), lockedItem);
-                        navigateTowards(client, player, level, navTarget, lockedItem.getX(), lockedItem.getY(), lockedItem.getZ(), isItemAtFence ? 1.0 : 0.65);
+                        navigateTowardsCollectedItem(client, player, level, lockedItem, isItemAtFence);
                         return;
                     }
 
@@ -762,13 +894,18 @@ public class FarmBotController {
                         }
 
                         if (neededCrop != null && !hasSeedInInventory(player, neededCrop) && !areasOutOfSeeds.contains(currentArea.getName())) {
-                            if (currentArea.getChestPos() != null) {
-                                sendChatMessage(client, "§e[Bot] نفذت بذور §a" + neededCrop.getArabicName() + "§e من الحقيبة! يتوجه البوت لجلب البذور من صندوق مزرعة §a" + currentArea.getName() + "§e...");
+                            BlockPos withdrawChest = findNextWithdrawChest(level, currentArea, neededCrop, Collections.emptySet());
+                            if (withdrawChest != null) {
+                                FarmArea.ChestRole roleLabel = currentArea.hasSeparateSeedChestsForCrop(neededCrop)
+                                    ? FarmArea.ChestRole.SEED
+                                    : FarmArea.ChestRole.CROP;
+                                sendChatMessage(client, "§e[Bot] نفذت بذور §a" + neededCrop.getArabicName() + "§e من الحقيبة! يتوجه البوت لجلب البذور من صندوق §b" + roleLabel.getArabicLabel() + "§e لمزرعة §a" + currentArea.getName() + "§e...");
+                                visitedWithdrawChests.clear();
                                 targetWithdrawArea = currentArea;
                                 targetWithdrawCrop = neededCrop;
+                                targetWithdrawChestPos = withdrawChest;
                                 currentStage = FarmStage.WITHDRAW;
-                                currentPath = null;
-                                currentGoal = null;
+                                resetNavPath();
                                 withdrawTimeoutTicks = 0;
                                 if (isDriving) {
                                     releaseControls(client);
@@ -849,12 +986,11 @@ public class FarmBotController {
 
                     currentAreaIndex = (currentAreaIndex + 1) % areas.size();
 
-                    // إذا كان خيار النوم مفعل ومر على الليل 20 ثانية (400 tick)، يتوجه البوت للنوم بعد انتهاء آخر مزرعة
-                    if (FarmAreaManager.getInstance().isSleepAtNight() && nightTicks >= 400) {
+                    // إذا كان خيار النوم مفعل والبعد يدعم الأسرة ومر على الليل 20 ثانية (400 tick)، يتوجه البوت للنوم بعد انتهاء آخر مزرعة
+                    if (FarmAreaManager.isBedDimensionSupported(level) && FarmAreaManager.getInstance().isSleepAtNight() && nightTicks >= 400) {
                         sendChatMessage(client, "§e[Bot] مر على الليل 20 ثانية واكتملت المزرعة الحالية. يتوجه البوت الآن للسرير للنوم حتى تطلع الشمس...");
                         currentStage = FarmStage.SLEEP;
-                        currentPath = null;
-                        currentGoal = null;
+                        resetNavPath();
                         if (isDriving) {
                             releaseControls(client);
                             isDriving = false;
@@ -863,22 +999,8 @@ public class FarmBotController {
                     }
 
                     // إذا امتلأ المخزون بالكامل، ينهي المزرعة الحالية ثم يتوجه للصناديق لتفريغ المحاصيل والاحتفاظ بـ 64 حبة
-                    if (isInventoryFull(player)) {
-                        visitedDepositChests.clear();
-                        FarmArea depositFarm = findAreaNeedingDeposit(player, level, areas);
-                        if (depositFarm != null) {
-                            sendChatMessage(client, "§e[Bot] المخزون ممتلئ واكتملت المزرعة الحالية! يتوجه لتفريغ المحاصيل بدءاً بصندوق مزرعة §a" + depositFarm.getName() + "§e...");
-                            targetDepositArea = depositFarm;
-                            currentStage = FarmStage.DEPOSIT;
-                            currentPath = null;
-                            currentGoal = null;
-                            depositTimeoutTicks = 0;
-                            if (isDriving) {
-                                releaseControls(client);
-                                isDriving = false;
-                            }
-                            return;
-                        }
+                    if (isInventoryFull(player) && tryStartDepositCycle(client, player, level, areas, "المخزون ممتلئ واكتملت المزرعة الحالية")) {
+                        return;
                     }
 
                     // إذا انتهت دورة كاملة على جميع المزارع دون وجود أي عمل مطلوب، ننتظر قليلاً بهدوء أو ننام إن كان ليلاً
@@ -894,37 +1016,21 @@ public class FarmBotController {
                             sendServerChatMessage(player, "المجد لمملكة الصيادين");
                         }
 
-                        if (FarmAreaManager.getInstance().isSleepAtNight() && nightTicks >= 400) {
+                        if (FarmAreaManager.isBedDimensionSupported(level) && FarmAreaManager.getInstance().isSleepAtNight() && nightTicks >= 400) {
                             sendChatMessage(client, "§e[Bot] مر على الليل 20 ثانية وانتهت جميع الأعمال. يتوجه البوت الآن للسرير للنوم حتى تطلع الشمس...");
                             currentStage = FarmStage.SLEEP;
-                            currentPath = null;
-                            currentGoal = null;
+                            resetNavPath();
                             if (isDriving) {
                                 releaseControls(client);
                                 isDriving = false;
                             }
                             return;
                         }
-                        if (isInventoryFull(player)) {
-                            visitedDepositChests.clear();
-                            FarmArea depositFarm = findAreaNeedingDeposit(player, level, areas);
-                            if (depositFarm != null) {
-                                sendChatMessage(client, "§e[Bot] المخزون ممتلئ! يتوجه لتفريغ المحاصيل بدءاً بصندوق مزرعة §a" + depositFarm.getName() + "§e...");
-                                targetDepositArea = depositFarm;
-                                currentStage = FarmStage.DEPOSIT;
-                                currentPath = null;
-                                currentGoal = null;
-                                depositTimeoutTicks = 0;
-                                if (isDriving) {
-                                    releaseControls(client);
-                                    isDriving = false;
-                                }
-                                return;
-                            }
+                        if (isInventoryFull(player) && tryStartDepositCycle(client, player, level, areas, "المخزون ممتلئ")) {
+                            return;
                         }
                         cooldownTicks = 60; // استراحة لمدة 3 ثوانٍ قبل فحص المزارع مرة أخرى
-                        currentPath = null;
-                        currentGoal = null;
+                        resetNavPath();
                         if (isDriving) {
                             releaseControls(client);
                             isDriving = false;
@@ -941,8 +1047,7 @@ public class FarmBotController {
         }
 
         // تحرير الأزرار عند عدم وجود أي عمل
-        currentPath = null;
-        currentGoal = null;
+        resetNavPath();
         if (isDriving) {
             releaseControls(client);
             isDriving = false;
@@ -962,12 +1067,11 @@ public class FarmBotController {
         boolean blockedByFence = FarmPathfinder.isPathBlockedByFence(level, player.position(), new Vec3(targetCenterX, targetCenterY, targetCenterZ));
 
         if (distSq > reachDistance * reachDistance || blockedByFence) {
-            // التحرك الذكي نحو الهدف مع تفادي الأسوار والدخول عبر البوابة
+            // التحرك الذكي نحو الهدف عبر BotNavigator مع تفادي الأسوار والدخول عبر البوابة
             navigateTowards(client, player, level, target.pos, targetCenterX, targetCenterY, targetCenterZ, reachDistance);
         } else {
             // التوقف عن المشي فور الاقتراب الكافي
-            currentPath = null;
-            currentGoal = null;
+            resetNavPath();
             if (isDriving) {
                 releaseControls(client);
                 isDriving = false;
@@ -994,8 +1098,7 @@ public class FarmBotController {
                 cooldownTicks = 4;
             } else if (target.type == ActionType.TILL) {
                 if (!isValidTillableSpot(level, target.area, pos)) {
-                    currentPath = null;
-                    currentGoal = null;
+                    resetNavPath();
                     cooldownTicks = 1;
                     return;
                 }
@@ -1027,7 +1130,7 @@ public class FarmBotController {
                     cooldownTicks = 5;
                 } else {
                     // في حال عدم وجود أي فأس، يتم إرسال تنبيه وتخطي إصلاح التربة
-                    if (hoeAlertTicks <= 0) {
+                    if (hoeAlertTicks <= 0 && !hasHoeInInventory(player)) {
                         sendChatMessage(client, "§c[Bot] لا يوجد أي فأس زراعي (Hoe) في الحقيبة لإصلاح التربة! يرجى توفير فأس زراعي.");
                         hoeAlertTicks = 200;
                     }
@@ -1035,8 +1138,7 @@ public class FarmBotController {
                 }
             } else if (target.type == ActionType.PLANT) {
                 if (!isAirDrySpace(level, pos)) {
-                    currentPath = null;
-                    currentGoal = null;
+                    resetNavPath();
                     cooldownTicks = 1;
                     return;
                 }
@@ -1093,42 +1195,36 @@ public class FarmBotController {
         }
     }
 
+    private void navigateTowardsCollectedItem(Minecraft client, LocalPlayer player, ClientLevel level, ItemEntity item, boolean isItemAtFence) {
+        BlockPos navTarget = getBestNavTargetForItem(level, player.blockPosition(), item);
+        boolean atExactItem = navTarget.equals(item.blockPosition());
+        double destX = atExactItem ? item.getX() : (navTarget.getX() + 0.5);
+        double destY = atExactItem ? item.getY() : navTarget.getY();
+        double destZ = atExactItem ? item.getZ() : (navTarget.getZ() + 0.5);
+        navigateTowards(client, player, level, navTarget, destX, destY, destZ, isItemAtFence ? 1.0 : 0.65);
+    }
+
     /**
-     * التنقل الذكي عبر نقاط المسار المحسوبة لتفادي الأسوار والجدران والماء وفتح الأبواب وصعود/هبوط الجسور
+     * التنقل الذكي الموحد عبر BotNavigator لتفادي الأسوار والجدران والماء وفتح وإغلاق الأبواب وحماية التربة الزراعية.
      */
     private void navigateTowards(Minecraft client, LocalPlayer player, ClientLevel level, BlockPos goalPos, double targetCenterX, double targetCenterY, double targetCenterZ, double reachDistance) {
-        if (pathRecalcCooldown > 0) {
-            pathRecalcCooldown--;
-        }
+        trackedGoalPos = goalPos;
 
-        // إذا كان البوت يلتف ويغلق الباب حالياً، نوقف متابعة الحركة ريثما ينتهي
-        if (handleDoorState(client, player, level, client.gameMode)) {
-            return;
-        }
-
-        // فحص وفتح أي أبواب أو بوابات سياج مغلقة في طريق البوت دائماً للدخول والخروج بسلاسة
-        checkAndOpenDoors(client, player, level, client.gameMode);
-
-        // تتبع الحركة الفعلية للاعب لمنع التعليق
         Vec3 currentPos = player.position();
-        if (lastPlayerPos != null && isDriving) {
-            double movedDistSq = currentPos.distanceToSqr(lastPlayerPos);
-            if (movedDistSq < 0.005) {
-                physicalStuckTicks++;
+        if (lastTargetPos != null && goalPos.equals(lastTargetPos)) {
+            if (!farmNavigator.isBusyClosingDoor() && lastPlayerPos != null && isDriving) {
+                double movedDistSq = currentPos.distanceToSqr(lastPlayerPos);
+                if (movedDistSq < 0.005) {
+                    physicalStuckTicks++;
+                } else {
+                    physicalStuckTicks = 0;
+                }
             } else {
                 physicalStuckTicks = 0;
             }
-        } else {
-            physicalStuckTicks = 0;
-        }
-        lastPlayerPos = currentPos;
-
-        if (goalPos.equals(lastTargetPos)) {
-            // التعليق الفعلي: اللاعب يحاول المشي منذ 70 نبضة (3.5 ثوانٍ) دون حراك فيزيائي
             if (physicalStuckTicks > 70) {
                 unreachablePositions.add(goalPos);
-                currentPath = null;
-                currentGoal = null;
+                resetNavPath();
                 lastTargetPos = null;
                 targetStuckTicks = 0;
                 physicalStuckTicks = 0;
@@ -1143,370 +1239,54 @@ public class FarmBotController {
             targetStuckTicks = 0;
             physicalStuckTicks = 0;
         }
+        lastPlayerPos = currentPos;
 
-        // إعادة حساب المسار عند تغير الهدف أو انتهاء المسار السابق
-        if (currentGoal == null || !currentGoal.equals(goalPos) || currentPath == null || currentPath.isEmpty()) {
-            currentGoal = goalPos;
-            int distManhattan = Math.abs(player.blockPosition().getX() - goalPos.getX()) + Math.abs(player.blockPosition().getZ() - goalPos.getZ());
-            // رفع الحد الأقصى للعقد إلى 15000 عقدة لدعم مسارات الجسور الطويلة والالتفافات من البيت إلى المزرعة
-            int maxNodes = distManhattan > 25 ? 15000 : 4000;
-            List<BlockPos> computed = FarmPathfinder.findPath(level, player.blockPosition(), goalPos, maxNodes);
-            if (computed != null && !computed.isEmpty()) {
-                currentPath = new ArrayList<>(computed);
+        Vec3 destVec = new Vec3(targetCenterX, targetCenterY, targetCenterZ);
+        boolean blockedByFence = FarmPathfinder.isPathBlockedByFence(level, currentPos, destVec);
+        double effectiveStopDist = blockedByFence ? 0.6 : Math.max(0.45, Math.min(reachDistance - 0.35, 2.2));
+        int distManhattan = Math.abs(player.blockPosition().getX() - goalPos.getX())
+            + Math.abs(player.blockPosition().getZ() - goalPos.getZ());
+        int maxNodes = distManhattan > 25 ? 15000 : 4000;
+
+        BotNavigator.NavResult navResult = farmNavigator.navigateTo(
+            client,
+            player,
+            level,
+            client.gameMode,
+            destVec,
+            shouldSprint(player),
+            effectiveStopDist,
+            isEating,
+            ROTATION_SPEED,
+            true,
+            maxNodes,
+            FarmPathfinder.PathOptions.FARM_DEFAULT,
+            true,
+            true,
+            null
+        );
+
+        if (navResult == BotNavigator.NavResult.BLOCKED_UNREACHABLE || farmNavigator.didLastStepFailUnreachable()) {
+            targetStuckTicks++;
+            if (targetStuckTicks > 4) {
+                if (distManhattan <= 15) {
+                    unreachablePositions.add(goalPos);
+                }
+                resetNavPath();
+                lastTargetPos = null;
                 targetStuckTicks = 0;
-            } else {
-                currentPath = new ArrayList<>();
-                targetStuckTicks++;
-                // إذا تعذر العثور على أي مسار 4 مرات متتالية (~4 ثوانٍ)
-                if (targetStuckTicks > 4) {
-                    // لا نحظر المحصول نهائياً إلا إذا كان اللاعب قريباً منه (أقل من 15 بلوكة)،
-                    // حتى لا نحظر محاصيل المزرعة عندما يكون اللاعب بعيداً في المنزل
-                    if (distManhattan <= 15) {
-                        unreachablePositions.add(goalPos);
-                    }
-                    currentPath = null;
-                    currentGoal = null;
-                    lastTargetPos = null;
-                    targetStuckTicks = 0;
-                    if (isDriving) {
-                        releaseControls(client);
-                        isDriving = false;
-                    }
-                    return;
-                }
-            }
-            pathRecalcCooldown = 20; // إعادة التقييم بعد ثانية كحد أقصى
-        }
-
-        if (currentPath != null && !currentPath.isEmpty()) {
-            // فحص هل اللاعب في الماء (للسير والسباحة على السطح دون غرق)
-            boolean inWater = player.isInWater()
-                || level.getBlockState(player.blockPosition()).is(Blocks.WATER)
-                || level.getBlockState(player.blockPosition().above()).is(Blocks.WATER);
-
-            BlockPos nextWp = currentPath.get(0);
-            double wpX = nextWp.getX() + 0.5;
-            double wpZ = nextWp.getZ() + 0.5;
-
-            double dx = player.getX() - wpX;
-            double dz = player.getZ() - wpZ;
-            double hDistSq = dx * dx + dz * dz;
-
-            // التحقق من وصول اللاعب أفقياً وعمودياً (عتبة مرنة وانسيابية للسبرنت السريع)
-            boolean sprintActive = shouldSprint(player);
-            double reachThreshold = sprintActive ? 0.95 : 0.75;
-
-            boolean yReached = inWater || player.getY() >= nextWp.getY() - 0.5;
-            if (hDistSq < reachThreshold * reachThreshold && yReached) {
-                currentPath.remove(0);
-                if (!currentPath.isEmpty()) {
-                    nextWp = currentPath.get(0);
-                    wpX = nextWp.getX() + 0.5;
-                    wpZ = nextWp.getZ() + 0.5;
-                }
-            }
-
-            if (currentPath.isEmpty()) {
-                boolean fenceBetween = FarmPathfinder.isPathBlockedByFence(level, player.position(), new Vec3(targetCenterX, targetCenterY, targetCenterZ));
-                if (fenceBetween) {
+                physicalStuckTicks = 0;
+                if (isDriving) {
                     releaseControls(client);
-                } else {
-                    moveTo(client, player, level, targetCenterX, targetCenterY, targetCenterZ, reachDistance, true);
+                    isDriving = false;
                 }
-            } else {
-                moveTo(client, player, level, wpX, nextWp.getY(), wpZ, 0.4, false);
-            }
-
-            // التحكم بالقفز والسباحة دون غرق
-            if (inWater) {
-                // إبقاء الرأس دائماً فوق الماء لمنع الغرق، والاندفاع السريع للسباحة
-                client.options.keyJump.setDown(true);
-                client.options.keySprint.setDown(true);
-            } else {
-                boolean onFarmSoil = isStandingOnFarmSoil(player, level);
-                boolean onChest = isStandingOnChest(player, level);
-                boolean facingFence = isBlockedByFenceOrWall(player, level);
-                double yDiff = nextWp.getY() - player.getY();
-
-                // منع القفز تماماً إذا كان أمامه سياج أو صندوق أو إذا كان يقف فوق صندوق حتى لا يقفز فوق السور ويسحق المحاصيل
-                if (facingFence || onChest) {
-                    client.options.keyJump.setDown(false);
-                    checkAndOpenDoors(client, player, level, client.gameMode);
-                } else if (yDiff >= 0.3 && !onFarmSoil && player.onGround()) {
-                    client.options.keyJump.setDown(true);
-                } else if (player.horizontalCollision && player.onGround() && !onFarmSoil && yDiff >= 0.1) {
-                    client.options.keyJump.setDown(true);
-                } else {
-                    client.options.keyJump.setDown(false);
-                }
+                return;
             }
         } else {
-            // خط مباشر كاحتياط في حال تعذر حساب المسار شريطة عدم وجود سياج يعترضه
-            boolean fenceBetween = FarmPathfinder.isPathBlockedByFence(level, player.position(), new Vec3(targetCenterX, targetCenterY, targetCenterZ));
-            if (fenceBetween) {
-                releaseControls(client);
-            } else {
-                moveTo(client, player, level, targetCenterX, targetCenterY, targetCenterZ, reachDistance, true);
-            }
-        }
-    }
-
-    /**
-     * فحص وفتح أي أبواب خشبية أو بوابات سياج مغلقة تعترض طريق البوت
-     */
-    private void checkAndOpenDoors(Minecraft client, LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode) {
-        if (gameMode == null) return;
-        if (doorInteractCooldown > 0) return;
-        if (doorState != DoorHandlingState.NONE) return;
-
-        BlockPos feet = player.blockPosition();
-
-        // تنظيف آخر باب تم إغلاقه إذا ابتعد عنه البوت مسافة كافية (> 4.5 بلوكات)
-        if (lastClosedDoorPos != null) {
-            double distSqToClosed = player.distanceToSqr(
-                lastClosedDoorPos.getX() + 0.5,
-                lastClosedDoorPos.getY() + 0.5,
-                lastClosedDoorPos.getZ() + 0.5
-            );
-            if (distSqToClosed > 4.5 * 4.5) {
-                lastClosedDoorPos = null;
-            }
+            targetStuckTicks = 0;
         }
 
-        Vec3 look = player.getViewVector(1.0F);
-        double lookHorizLen = Math.sqrt(look.x * look.x + look.z * look.z);
-
-        // 1. أولاً: فحص الأبواب وبوابات السياج المغلقة أمام البوت مباشرة لفتحها للعبور
-        for (int dx = -2; dx <= 2; dx++) {
-            for (int dz = -2; dz <= 2; dz++) {
-                for (int dy = 0; dy <= 2; dy++) {
-                    BlockPos checkPos = feet.offset(dx, dy, dz);
-
-                    // استثناء الباب الذي تم إغلاقه للتو منعاً لإعادة فتحه وهو خلف ظهر اللاعب
-                    if (lastClosedDoorPos != null && checkPos.equals(lastClosedDoorPos)) {
-                        continue;
-                    }
-
-                    BlockState state = level.getBlockState(checkPos);
-                    boolean isClosedDoor = FarmPathfinder.isOpenableDoor(state) && !state.getValue(DoorBlock.OPEN);
-                    boolean isClosedGate = FarmPathfinder.isOpenableGate(state) && !state.getValue(FenceGateBlock.OPEN);
-
-                    if (isClosedDoor || isClosedGate) {
-                        double toDoorX = (checkPos.getX() + 0.5) - player.getX();
-                        double toDoorZ = (checkPos.getZ() + 0.5) - player.getZ();
-                        double horizDist = Math.sqrt(toDoorX * toDoorX + toDoorZ * toDoorZ);
-
-                        // التحقق من أن الباب أمام البوت في اتجاه حركته ونظره وليس خلفه أو بجانبه
-                        if (horizDist > 0.1 && lookHorizLen > 0.01) {
-                            double dot = (look.x * toDoorX + look.z * toDoorZ) / (lookHorizLen * horizDist);
-                            if (dot < 0.4) {
-                                // الباب خلف اللاعب أو بزاوية حادة، لا يتم فتحه إطلاقاً
-                                continue;
-                            }
-                        }
-
-                        double dSq = player.distanceToSqr(checkPos.getX() + 0.5, checkPos.getY() + 0.5, checkPos.getZ() + 0.5);
-                        if (dSq <= 2.8 * 2.8) {
-                            int safeSlot = findSafeInteractionSlot(player);
-                            if (safeSlot != -1 && safeSlot != player.getInventory().getSelectedSlot()) {
-                                selectHotbarSlot(player, safeSlot);
-                            }
-
-                            smoothLookAt(player, checkPos.getX() + 0.5, checkPos.getY() + 0.5, checkPos.getZ() + 0.5, 60.0f);
-
-                            Vec3 hitVec = Vec3.atCenterOf(checkPos);
-                            BlockHitResult hit = new BlockHitResult(hitVec, Direction.UP, checkPos, false);
-                            gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
-                            player.swing(InteractionHand.MAIN_HAND);
-
-                            doorInteractCooldown = 10;
-                            activeDoorPos = checkPos.immutable();
-                            activeDoorEntryPos = player.position();
-                            doorState = DoorHandlingState.STEPPING_THROUGH;
-                            doorStateTicks = 0;
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. ثانياً: فحص الأبواب المفتوحة مسبقاً إذا كان البوت يمر عبرها لتسجيلها وإغلاقها بعد التخطي
-        for (int dx = -1; dx <= 1; dx++) {
-            for (int dz = -1; dz <= 1; dz++) {
-                for (int dy = 0; dy <= 1; dy++) {
-                    BlockPos checkPos = feet.offset(dx, dy, dz);
-
-                    // استثناء الباب المغلق للتو
-                    if (lastClosedDoorPos != null && checkPos.equals(lastClosedDoorPos)) {
-                        continue;
-                    }
-
-                    BlockState state = level.getBlockState(checkPos);
-                    boolean isOpenDoor = FarmPathfinder.isOpenableDoor(state) && state.getValue(DoorBlock.OPEN);
-                    boolean isOpenGate = FarmPathfinder.isOpenableGate(state) && state.getValue(FenceGateBlock.OPEN);
-
-                    if (isOpenDoor || isOpenGate) {
-                        double toDoorX = (checkPos.getX() + 0.5) - player.getX();
-                        double toDoorZ = (checkPos.getZ() + 0.5) - player.getZ();
-                        double horizDist = Math.sqrt(toDoorX * toDoorX + toDoorZ * toDoorZ);
-
-                        if (horizDist > 0.1 && lookHorizLen > 0.01) {
-                            double dot = (look.x * toDoorX + look.z * toDoorZ) / (lookHorizLen * horizDist);
-                            if (dot < 0.2) {
-                                continue;
-                            }
-                        }
-
-                        double dSq = player.distanceToSqr(checkPos.getX() + 0.5, checkPos.getY() + 0.5, checkPos.getZ() + 0.5);
-                        if (dSq <= 1.25 * 1.25) {
-                            activeDoorPos = checkPos.immutable();
-                            activeDoorEntryPos = player.position();
-                            doorState = DoorHandlingState.STEPPING_THROUGH;
-                            doorStateTicks = 0;
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * التعامل مع دورة إغلاق الباب: التوقف التام عند تخطي الباب، الالتفاف نحوه، إغلاقه، ثم استئناف السير.
-     * تعود بـ true إذا كان البوت يقوم حالياً بإغلاق الباب لإيقاف الحركة المعتادة مؤقتاً.
-     */
-    private boolean handleDoorState(Minecraft client, LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode) {
-        if (doorInteractCooldown > 0) {
-            doorInteractCooldown--;
-        }
-
-        if (doorState == DoorHandlingState.NONE || activeDoorPos == null) {
-            return false;
-        }
-
-        doorStateTicks++;
-
-        // مهلة أمان زمنية: إذا مضت 4 ثوانٍ دون إتمام العبور، نلغي الحالة لتفادي التعليق
-        if (doorStateTicks > 80) {
-            resetDoorState(client);
-            return false;
-        }
-
-        BlockState state = level.getBlockState(activeDoorPos);
-        boolean isOpen = (FarmPathfinder.isOpenableDoor(state) && state.getValue(DoorBlock.OPEN))
-            || (FarmPathfinder.isOpenableGate(state) && state.getValue(FenceGateBlock.OPEN));
-
-        // إذا كان الباب قد أُغلق بالفعل من جهة أخرى
-        if (!isOpen && doorState != DoorHandlingState.CONFIRMING) {
-            resetDoorState(client);
-            return false;
-        }
-
-        double doorCenterX = activeDoorPos.getX() + 0.5;
-        double doorCenterY = activeDoorPos.getY() + 0.5;
-        double doorCenterZ = activeDoorPos.getZ() + 0.5;
-
-        double currX = player.getX() - doorCenterX;
-        double currZ = player.getZ() - doorCenterZ;
-        double hDistSq = currX * currX + currZ * currZ;
-        double hDist = Math.sqrt(hDistSq);
-
-        if (doorState == DoorHandlingState.STEPPING_THROUGH) {
-            if (activeDoorEntryPos == null) {
-                activeDoorEntryPos = player.position();
-            }
-
-            double entryX = doorCenterX - activeDoorEntryPos.x;
-            double entryZ = doorCenterZ - activeDoorEntryPos.z;
-            double crossDot = entryX * currX + entryZ * currZ;
-
-            // إذا ابتعد كثيراً (> 4.2 بلوكات) نلغي التتبع
-            if (hDist > 4.2) {
-                resetDoorState(client);
-                return false;
-            }
-
-            // تحقق تخطي الباب والعبور للجانب المقابل:
-            // crossDot > 0.05 للدلالة على الانتقال للجهة الأخرى من الباب
-            // و hDist >= 1.35 لضمان ابتعاد جسم اللاعب عن إطار الباب بالكامل
-            if (crossDot > 0.05 && hDist >= 1.35) {
-                // إيقاف الركض والحركة فوراً وبشكل حاسم!
-                releaseControls(client);
-                isDriving = false;
-                doorState = DoorHandlingState.TURNING_AND_CLOSING;
-                doorStateTicks = 0;
-                return true;
-            }
-
-            // لا يزال يعبر الباب أثناء السير العادي
-            return false;
-        }
-
-        if (doorState == DoorHandlingState.TURNING_AND_CLOSING) {
-            // إيقاف أي حركة تماماً
-            releaseControls(client);
-            isDriving = false;
-
-            // الالتفاف مباشرة نحو الباب
-            lookAtTarget(player, doorCenterX, doorCenterY, doorCenterZ);
-
-            // النقر على الباب لإغلاقه
-            if (isOpen) {
-                int safeSlot = findSafeInteractionSlot(player);
-                if (safeSlot != -1 && safeSlot != player.getInventory().getSelectedSlot()) {
-                    selectHotbarSlot(player, safeSlot);
-                }
-
-                Vec3 hitVec = Vec3.atCenterOf(activeDoorPos);
-                BlockHitResult hit = new BlockHitResult(hitVec, Direction.UP, activeDoorPos, false);
-                gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
-                player.swing(InteractionHand.MAIN_HAND);
-            }
-
-            doorState = DoorHandlingState.CONFIRMING;
-            doorConfirmTicks = 3; // انتظار 3 نبضات للتأكد من انغلاق الباب قبل مواصلة الطريق
-            return true;
-        }
-
-        if (doorState == DoorHandlingState.CONFIRMING) {
-            releaseControls(client);
-            isDriving = false;
-
-            if (doorConfirmTicks > 0) {
-                doorConfirmTicks--;
-                return true;
-            }
-
-            // اكتمل الإغلاق بنجاح! ننهي التتبع ونستأنف السير
-            doorInteractCooldown = 15;
-            lastClosedDoorPos = activeDoorPos;
-            resetDoorState(client);
-            return false;
-        }
-
-        return false;
-    }
-
-    private void lookAtTarget(LocalPlayer player, double targetX, double targetY, double targetZ) {
-        double dx = targetX - player.getX();
-        double dy = targetY - player.getEyeY();
-        double dz = targetZ - player.getZ();
-        double dist = Math.sqrt(dx * dx + dz * dz);
-
-        float targetYaw = (float) (Math.atan2(dz, dx) * 180.0 / Math.PI) - 90.0f;
-        float targetPitch = (float) (-(Math.atan2(dy, dist) * 180.0 / Math.PI));
-
-        player.setYRot(targetYaw);
-        player.setXRot(targetPitch);
-    }
-
-    private void resetDoorState(Minecraft client) {
-        activeDoorPos = null;
-        activeDoorEntryPos = null;
-        doorState = DoorHandlingState.NONE;
-        doorStateTicks = 0;
-        doorConfirmTicks = 0;
+        isDriving = (navResult == BotNavigator.NavResult.MOVING);
     }
 
     /**
@@ -1558,170 +1338,8 @@ public class FarmBotController {
         return BotEquipmentHelper.findSafeInteractionSlot(player);
     }
 
-    private boolean isBlockedByFenceOrWall(LocalPlayer player, ClientLevel level) {
-        Vec3 look = player.getLookAngle();
-        BlockPos feet = player.blockPosition();
-
-        int ox = (int) Math.round(look.x);
-        int oz = (int) Math.round(look.z);
-        if (ox != 0 || oz != 0) {
-            BlockPos front = feet.offset(ox, 0, oz);
-            if (isFenceOrClosedGate(level, front) || isFenceOrClosedGate(level, front.above()) || isFenceOrClosedGate(level, front.below())) {
-                return true;
-            }
-        }
-
-        if (player.horizontalCollision) {
-            for (Direction dir : Direction.Plane.HORIZONTAL) {
-                BlockPos side = feet.relative(dir);
-                if (isFenceOrClosedGate(level, side) || isFenceOrClosedGate(level, side.above())) {
-                    double dot = look.x * dir.getStepX() + look.z * dir.getStepZ();
-                    if (dot > -0.2) {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        return false;
-    }
-
-    private static boolean isFenceOrClosedGate(ClientLevel level, BlockPos pos) {
-        BlockState state = level.getBlockState(pos);
-        if (FarmPathfinder.isFenceOrWall(state)) return true;
-        if (FarmPathfinder.isOpenableGate(state) && !state.getValue(FenceGateBlock.OPEN)) return true;
-        // معاملة الصناديق والحاويات كحواجز لمنع التسلق والقفز فوقها بجوار الأسوار
-        if (FarmPathfinder.isChestOrContainer(state)) return true;
-        return false;
-    }
-
-    private boolean isStandingOnChest(LocalPlayer player, ClientLevel level) {
-        BlockPos feet = player.blockPosition();
-        BlockState atFeet = level.getBlockState(feet);
-        BlockState belowFeet = level.getBlockState(feet.below());
-        return FarmPathfinder.isChestOrContainer(atFeet) || FarmPathfinder.isChestOrContainer(belowFeet);
-    }
-
-    private boolean isStandingOnFarmSoil(LocalPlayer player, ClientLevel level) {
-        BlockPos feet = player.blockPosition();
-        BlockState atFeet = level.getBlockState(feet);
-        BlockState belowFeet = level.getBlockState(feet.below());
-        return atFeet.is(Blocks.FARMLAND) || atFeet.is(Blocks.SOUL_SAND)
-            || belowFeet.is(Blocks.FARMLAND) || belowFeet.is(Blocks.SOUL_SAND)
-            || atFeet.getBlock() instanceof CropBlock
-            || belowFeet.getBlock() instanceof CropBlock
-            || atFeet.getBlock() instanceof NetherWartBlock
-            || belowFeet.getBlock() instanceof NetherWartBlock;
-    }
-
     private void selectHotbarSlot(LocalPlayer player, int slot) {
         BotEquipmentHelper.selectHotbarSlot(player, slot);
-    }
-
-    private void moveTo(Minecraft client, LocalPlayer player, ClientLevel level, double tx, double ty, double tz, double stopDist) {
-        moveTo(client, player, level, tx, ty, tz, stopDist, true);
-    }
-
-    private void moveTo(Minecraft client, LocalPlayer player, ClientLevel level, double tx, double ty, double tz, double stopDist, boolean controlJump) {
-        double dx = tx - player.getX();
-        double dz = tz - player.getZ();
-        double distSq = dx * dx + dz * dz;
-
-        // التوقف عند الوصول للمسافة المطلوبة لمنع تجاوز النقطة والالتفاف حولها
-        if (stopDist > 0 && distSq <= stopDist * stopDist) {
-            client.options.keyUp.setDown(false);
-            client.options.keySprint.setDown(false);
-            player.setSprinting(false);
-            BotNavigator.maintainWaterBuoyancy(client, player, level, null);
-            isDriving = false;
-            return;
-        }
-
-        isDriving = true;
-
-        boolean inWater = BotNavigator.isEntityInWater(level, player);
-
-        if (inWater) {
-            // السباحة والطفو الآمن في المياه العميقة مع القفز فقط عند الاصطدام بضفة الخروج
-            BotNavigator.maintainWaterBuoyancy(client, player, level, null);
-            if (player.horizontalCollision) {
-                client.options.keyJump.setDown(true);
-            }
-            client.options.keySprint.setDown(true);
-        }
-
-        float diffYaw = calculateYawDiff(player, tx, tz);
-        smoothLookAt(player, tx, player.getEyeY(), tz, ROTATION_SPEED);
-
-        boolean targetBlockedByFence = FarmPathfinder.isPathBlockedByFence(level, player.position(), new Vec3(tx, ty, tz));
-        boolean collisionWithFence = player.horizontalCollision && isBlockedByFenceOrWall(player, level);
-
-        if (targetBlockedByFence || collisionWithFence) {
-            // مواجهة سياج في مسار الحركة المباشر: إيقاف الضغط للأمام والقفز والسبرنت
-            client.options.keyUp.setDown(false);
-            client.options.keyJump.setDown(false);
-            client.options.keySprint.setDown(false);
-            player.setSprinting(false);
-
-            // محاولة فتح بوابة السياج إن كانت قريبة
-            checkAndOpenDoors(client, player, level, client.gameMode);
-
-            stuckTicks++;
-            if (stuckTicks >= 6) {
-                // تراجع طفيف لفك الالتصاق بالسياج وإفساح المجال للالتفاف
-                client.options.keyDown.setDown(true);
-            }
-            if (stuckTicks >= 8) {
-                client.options.keyDown.setDown(false);
-                // إعادة تقييم المسار فوراً لاتباع المسار الحقيقي المفتوح أو البوابة
-                currentPath = null;
-                currentGoal = null;
-                pathRecalcCooldown = 0;
-                stuckTicks = 0;
-            }
-            return;
-        } else {
-            if (client.options.keyDown.isDown()) {
-                client.options.keyDown.setDown(false);
-            }
-        }
-
-        boolean canSprint = shouldSprint(player);
-
-        // السماح بالحركة أثناء الالتفاف لجعل الانعطاف طبيعياً وسلساً دون توقف متكرر، وتفعيل السبرنت التلقائي خارج المزرعة
-        if (Math.abs(diffYaw) < 75.0f) {
-            client.options.keyUp.setDown(true);
-            if (canSprint && Math.abs(diffYaw) < 40.0f) {
-                client.options.keySprint.setDown(true);
-                player.setSprinting(true);
-            } else {
-                client.options.keySprint.setDown(false);
-                player.setSprinting(false);
-            }
-        } else {
-            client.options.keyUp.setDown(false);
-            client.options.keySprint.setDown(false);
-            player.setSprinting(false);
-        }
-
-        if (controlJump && !inWater) {
-            // تفادي القفز العشوائي وعدم القفز إطلاقاً على التربة الزراعية أو فوق الصناديق لحمايتها من التلف
-            boolean onFarmSoil = isStandingOnFarmSoil(player, level);
-            boolean onChest = isStandingOnChest(player, level);
-
-            if (onChest) {
-                // منع القفز نهائياً عند الوقوف فوق صندوق لحمايته من القفز فوق السور والسقوط على المحاصيل
-                client.options.keyJump.setDown(false);
-            } else if (player.horizontalCollision && player.onGround() && !onFarmSoil) {
-                stuckTicks++;
-                if (stuckTicks >= 3) {
-                    client.options.keyJump.setDown(true);
-                }
-            } else {
-                stuckTicks = 0;
-                client.options.keyJump.setDown(false);
-            }
-        }
     }
 
     private void releaseControls(Minecraft client) {
@@ -1732,14 +1350,13 @@ public class FarmBotController {
             client.options.keyRight.setDown(false);
             client.options.keyJump.setDown(false);
             client.options.keySprint.setDown(false);
-            if (!FightBotController.getInstance().isDefending()) {
+            if (!FightBotController.getInstance().isDefending() && !FightBotController.getInstance().isInFarmCombat()) {
                 client.options.keyUse.setDown(false);
             }
         }
         if (client.player != null) {
             client.player.setSprinting(false);
         }
-        stuckTicks = 0;
     }
 
     private boolean smoothLookAt(LocalPlayer player, double targetX, double targetY, double targetZ, float maxSpeed) {
@@ -1764,13 +1381,6 @@ public class FarmBotController {
         player.setXRot(currentPitch + stepPitch);
 
         return Math.abs(diffYaw) < 30.0f && Math.abs(diffPitch) < 30.0f;
-    }
-
-    private float calculateYawDiff(LocalPlayer player, double targetX, double targetZ) {
-        double dx = targetX - player.getX();
-        double dz = targetZ - player.getZ();
-        float targetYaw = (float) (Math.atan2(dz, dx) * 180.0 / Math.PI) - 90.0f;
-        return wrapDegrees(targetYaw - player.getYRot());
     }
 
     private float wrapDegrees(float degrees) {
@@ -2171,8 +1781,8 @@ public class FarmBotController {
 
         // عند الانتقال للسرير
         if (currentStage == FarmStage.SLEEP) {
-            BlockPos bedPos = FarmAreaManager.getInstance().getBedPos();
-            if (bedPos != null && player.distanceToSqr(bedPos.getX() + 0.5, bedPos.getY() + 0.5, bedPos.getZ() + 0.5) <= 6.0 * 6.0) {
+            BlockPos sleepTarget = trackedGoalPos != null ? trackedGoalPos : FarmAreaManager.getInstance().getBedPos();
+            if (sleepTarget != null && player.distanceToSqr(sleepTarget.getX() + 0.5, sleepTarget.getY() + 0.5, sleepTarget.getZ() + 0.5) <= 6.0 * 6.0) {
                 // التهدئة والمشي الطبيعي عند الاقتراب من السرير والمنزل لتفادي الاندفاع ولإغلاق الباب بدقة
                 return false;
             }
@@ -2195,9 +1805,20 @@ public class FarmBotController {
     }
 
     /**
-     * معالجة الذهاب إلى السرير والنوم عند حلول الليل
+     * معالجة الذهاب إلى السرير والنوم عند حلول الليل (في الأبعاد التي تدعم الأسرة فقط)
      */
     private void handleSleepStage(Minecraft client, LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode) {
+        if (!FarmAreaManager.isBedDimensionSupported(level)) {
+            if (!dimensionSleepNoticeSent) {
+                sendChatMessage(client, "§e[Bot] البُعد الحالي (" + FarmAreaManager.getInstance().getCurrentDimensionDisplayName() + ") لا يدعم النوم بالسرير! تجاهل النوم والاستمرار بالزراعة.");
+                dimensionSleepNoticeSent = true;
+            }
+            nightTicks = 0;
+            resetNavPath();
+            currentStage = FarmStage.HARVEST;
+            return;
+        }
+
         if (player.isSleeping()) {
             if (isDriving) {
                 releaseControls(client);
@@ -2211,8 +1832,29 @@ public class FarmBotController {
             return;
         }
 
-        // تحديد موقع السرير (سواء المحفوظ مسبقاً أو البحث التلقائي عن أقرب سرير)
+        // تحديد موقع السرير (التحقق من صلاحية المحفوظ وعدم انشغاله، أو البحث عن سرير شاغر قريب)
         BlockPos bedPos = FarmAreaManager.getInstance().getBedPos();
+        if (bedPos != null) {
+            BlockState savedState = level.getBlockState(bedPos);
+            if (!isBedBlock(savedState)) {
+                FarmAreaManager.getInstance().setBedPos(null);
+                bedPos = null;
+            } else if (isBedOccupied(level, bedPos)) {
+                BlockPos alternateBed = findNearbyBed(player, level, 48);
+                if (alternateBed != null) {
+                    bedPos = alternateBed;
+                } else {
+                    if (!bedAlertSent) {
+                        sendChatMessage(client, "§e[Bot] السرير المحدد مشغول حالياً ولا يوجد سرير آخر شاغر! يواصل البوت الزراعة حتى يتفرغ السرير.");
+                        bedAlertSent = true;
+                    }
+                    resetNavPath();
+                    currentStage = FarmStage.HARVEST;
+                    return;
+                }
+            }
+        }
+
         if (bedPos == null) {
             bedPos = findNearbyBed(player, level, 48);
             if (bedPos != null) {
@@ -2223,10 +1865,11 @@ public class FarmBotController {
 
         if (bedPos == null) {
             if (!bedAlertSent) {
-                sendChatMessage(client, "§c[Bot] حان وقت النوم ولكن لم يتم العثور على أي سرير! يرجى تعيين السرير عبر: §e/bot farm bed set §cأو وضع سرير بالقرب منك.");
+                sendChatMessage(client, "§c[Bot] حان وقت النوم ولكن لم يتم العثور على أي سرير شاغر! يرجى تعيين السرير عبر: §e/bot farm bed set §cأو وضع سرير بالقرب منك.");
                 bedAlertSent = true;
             }
             // في حال عدم وجود أي سرير، يواصل العمل في المزارع حتى لا يتوقف
+            resetNavPath();
             currentStage = FarmStage.HARVEST;
             return;
         }
@@ -2237,14 +1880,15 @@ public class FarmBotController {
         double distSq = player.distanceToSqr(bedCenterX, bedCenterY, bedCenterZ);
 
         if (distSq > 2.8 * 2.8) {
-            // التوجه الذكي نحو السرير مع تفادي العقبات والماء وفتح الأبواب
+            // التوجه الذكي نحو السرير مع تفادي العقبات والماء وفتح وإغلاق الأبواب
             navigateTowards(client, player, level, bedPos, bedCenterX, bedCenterY, bedCenterZ, 2.5);
 
             // رسم خط مسار الذهاب إلى السرير بجزيئات مرئية خضراء متألقة فوق الجسور وبالممرات
-            if (currentPath != null && !currentPath.isEmpty()) {
-                int drawLimit = Math.min(currentPath.size(), 24);
+            List<BlockPos> activePath = farmNavigator.getCurrentPath();
+            if (!activePath.isEmpty()) {
+                int drawLimit = Math.min(activePath.size(), 24);
                 for (int i = 0; i < drawLimit; i++) {
-                    BlockPos p = currentPath.get(i);
+                    BlockPos p = activePath.get(i);
                     level.addParticle(
                         ParticleTypes.HAPPY_VILLAGER,
                         p.getX() + 0.5,
@@ -2256,8 +1900,7 @@ public class FarmBotController {
             }
         } else {
             // الوصول إلى السرير: التوقف والتأكد من إغلاق أي باب مفتوح في الغرفة قبل الاستلقاء للنوم
-            currentPath = null;
-            currentGoal = null;
+            resetNavPath();
             if (isDriving) {
                 releaseControls(client);
                 isDriving = false;
@@ -2265,7 +1908,7 @@ public class FarmBotController {
 
             // فحص هل يوجد باب مفتوح في محيط الغرفة (ضمن مدى التفاعل حتى 4.2 بلوكات)
             BlockPos openDoorPos = findNearbyOpenDoor(player, level, 4.2);
-            if (openDoorPos != null && doorInteractCooldown <= 0) {
+            if (openDoorPos != null && sleepDoorCooldown <= 0) {
                 int safeSlot = findSafeInteractionSlot(player);
                 if (safeSlot != -1 && safeSlot != player.getInventory().getSelectedSlot()) {
                     selectHotbarSlot(player, safeSlot);
@@ -2276,8 +1919,8 @@ public class FarmBotController {
                 BlockHitResult hit = new BlockHitResult(hitVec, Direction.UP, openDoorPos, false);
                 gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
                 player.swing(InteractionHand.MAIN_HAND);
-                doorInteractCooldown = 4;
-                resetDoorState(client);
+                sleepDoorCooldown = 6;
+                farmNavigator.resetDoorState(client);
                 cooldownTicks = 5;
                 return;
             }
@@ -2325,6 +1968,28 @@ public class FarmBotController {
         return bestDoor;
     }
 
+    private static boolean isBedBlock(BlockState state) {
+        return state != null && (state.getBlock() instanceof BedBlock || state.is(BlockTags.BEDS));
+    }
+
+    private static boolean isBedOccupied(ClientLevel level, BlockPos pos) {
+        if (level == null || pos == null) return false;
+        BlockState state = level.getBlockState(pos);
+        if (state.getOptionalValue(BedBlock.OCCUPIED).orElse(false)) {
+            return true;
+        }
+        Direction facing = state.getOptionalValue(BedBlock.FACING).orElse(null);
+        BedPart part = state.getOptionalValue(BedBlock.PART).orElse(null);
+        if (facing != null && part != null) {
+            BlockPos partner = (part == BedPart.FOOT) ? pos.relative(facing) : pos.relative(facing.getOpposite());
+            BlockState partnerState = level.getBlockState(partner);
+            if (isBedBlock(partnerState) && partnerState.getOptionalValue(BedBlock.OCCUPIED).orElse(false)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private BlockPos findNearbyBed(LocalPlayer player, ClientLevel level, int radius) {
         BlockPos origin = player.blockPosition();
         BlockPos best = null;
@@ -2335,7 +2000,9 @@ public class FarmBotController {
                 for (int z = -radius; z <= radius; z++) {
                     BlockPos pos = origin.offset(x, y, z);
                     BlockState state = level.getBlockState(pos);
-                    if (state.getBlock() instanceof BedBlock || state.is(BlockTags.BEDS)) {
+                    if (isBedBlock(state)
+                            && !isBedOccupied(level, pos)
+                            && !FarmPathfinder.isHazard(level.getBlockState(pos.above()))) {
                         double dist = player.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
                         if (dist < bestDistSq) {
                             bestDistSq = dist;
@@ -2395,21 +2062,125 @@ public class FarmBotController {
         return FarmCrop.WHEAT;
     }
 
+    private static void markChestVisited(ClientLevel level, Set<BlockPos> visited, BlockPos pos) {
+        if (pos == null || visited == null) return;
+        visited.add(pos.immutable());
+        BlockPos half = FarmAreaManager.getConnectedChestHalf(level, pos);
+        if (half != null) {
+            visited.add(half);
+        }
+    }
+
+    private static boolean isChestVisited(ClientLevel level, Set<BlockPos> visited, BlockPos pos) {
+        return pos != null && visited != null && FarmAreaManager.containsStorageContainer(level, visited, pos);
+    }
+
     /**
-     * معالجة الذهاب إلى الصندوق لجلب البذور عند نفادها من الحقيبة
+     * التحرك نحو حاوية وفتحها، مع إرجاع false فوراً إذا ثبت عدم وجود حاوية في الموقع القريب.
      */
-    private void handleWithdrawStage(Minecraft client, LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode) {
-        if (targetWithdrawArea == null || targetWithdrawArea.getChestPos() == null || targetWithdrawCrop == null) {
-            targetWithdrawArea = null;
-            targetWithdrawCrop = null;
-            currentStage = FarmStage.PLANT;
+    private boolean navigateAndOpenContainer(
+            Minecraft client,
+            LocalPlayer player,
+            ClientLevel level,
+            MultiPlayerGameMode gameMode,
+            BlockPos chestPos) {
+        if (chestPos == null) return false;
+        double cx = chestPos.getX() + 0.5;
+        double cy = chestPos.getY() + 0.5;
+        double cz = chestPos.getZ() + 0.5;
+        double distSq = player.distanceToSqr(cx, cy, cz);
+
+        if (distSq <= 8.0 * 8.0 && !FarmAreaManager.isStorageContainerBlock(level.getBlockState(chestPos))) {
+            return false;
+        }
+
+        if (distSq > 2.8 * 2.8) {
+            navigateTowards(client, player, level, chestPos, cx, cy, cz, 2.5);
+        } else {
+            resetNavPath();
+            if (isDriving) {
+                releaseControls(client);
+                isDriving = false;
+            }
+
+            smoothLookAt(player, cx, cy, cz, ROTATION_SPEED);
+
+            BlockHitResult hit = new BlockHitResult(
+                new Vec3(cx, cy, cz),
+                Direction.UP,
+                chestPos,
+                false
+            );
+            gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
+            player.swing(InteractionHand.MAIN_HAND);
+            cooldownTicks = 15; // انتظار استجابة السيرفر وفتح الحاوية
+        }
+        return true;
+    }
+
+    private BlockPos findNextWithdrawChest(
+            ClientLevel level,
+            FarmArea area,
+            FarmCrop crop,
+            Set<BlockPos> excludedChests) {
+        if (area == null || crop == null) return null;
+        List<BlockPos> candidates = area.hasSeparateSeedChestsForCrop(crop)
+            ? area.getSeedChests()
+            : area.getCropChests();
+        for (BlockPos pos : candidates) {
+            if (!isChestVisited(level, excludedChests, pos)) {
+                return pos;
+            }
+        }
+        return null;
+    }
+
+    private void advanceOrFinishWithdraw(
+            Minecraft client,
+            ClientLevel level,
+            String emptyOrErrorMsg) {
+        if (targetWithdrawChestPos != null) {
+            markChestVisited(level, visitedWithdrawChests, targetWithdrawChestPos);
+        }
+        BlockPos nextChest = findNextWithdrawChest(level, targetWithdrawArea, targetWithdrawCrop, visitedWithdrawChests);
+        if (nextChest != null) {
+            sendChatMessage(client, "§e[Bot] " + emptyOrErrorMsg + " ينتقل البوت الآن للصندوق التالي للمزرعة...");
+            targetWithdrawChestPos = nextChest;
+            withdrawTimeoutTicks = 0;
+            resetNavPath();
+            cooldownTicks = 10;
             return;
         }
 
-        BlockPos chestPos = targetWithdrawArea.getChestPos();
-        double chestCenterX = chestPos.getX() + 0.5;
-        double chestCenterY = chestPos.getY() + 0.5;
-        double chestCenterZ = chestPos.getZ() + 0.5;
+        if (targetWithdrawArea != null) {
+            sendChatMessage(client, "§c[Bot] " + emptyOrErrorMsg + " في جميع صناديق مزرعة §e" + targetWithdrawArea.getName() + "§c! تجاوز مرحلة الزراعة لهذه الدورة.");
+            areasOutOfSeeds.add(targetWithdrawArea.getName());
+        }
+        targetWithdrawArea = null;
+        targetWithdrawCrop = null;
+        targetWithdrawChestPos = null;
+        visitedWithdrawChests.clear();
+        withdrawTimeoutTicks = 0;
+        cooldownTicks = 15;
+        currentStage = FarmStage.HARVEST;
+        List<FarmArea> active = FarmAreaManager.getInstance().getActiveAreas();
+        if (!active.isEmpty()) {
+            currentAreaIndex = (currentAreaIndex + 1) % active.size();
+        }
+    }
+
+    /**
+     * معالجة الذهاب إلى الصندوق لجلب البذور عند نفادها من الحقيبة (مع دعم تعدد الصناديق وصندوق البذور المنفصل)
+     */
+    private void handleWithdrawStage(Minecraft client, LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode) {
+        if (targetWithdrawArea == null || targetWithdrawChestPos == null || targetWithdrawCrop == null) {
+            targetWithdrawArea = null;
+            targetWithdrawCrop = null;
+            targetWithdrawChestPos = null;
+            visitedWithdrawChests.clear();
+            currentStage = FarmStage.PLANT;
+            return;
+        }
 
         // إذا كان الصندوق مفتوحاً بالفعل (شاشة الحاوية مفتوحة)
         if (player.containerMenu != null && player.containerMenu != player.inventoryMenu) {
@@ -2435,17 +2206,15 @@ public class FarmBotController {
             if (lastWithdrawnCount > 0) {
                 sendChatMessage(client, "§a[Bot] تم سحب §e" + lastWithdrawnCount + " §aحبة بذور (" + targetWithdrawCrop.getArabicName() + ") من الصندوق بنجاح! استئناف الزراعة...");
                 currentStage = FarmStage.PLANT;
+                targetWithdrawArea = null;
+                targetWithdrawCrop = null;
+                targetWithdrawChestPos = null;
+                visitedWithdrawChests.clear();
+                withdrawTimeoutTicks = 0;
+                cooldownTicks = 15;
             } else {
-                sendChatMessage(client, "§c[Bot] لا توجد بذور (" + targetWithdrawCrop.getArabicName() + ") في صندوق مزرعة §e" + targetWithdrawArea.getName() + "§c! تجاوز مرحلة الزراعة لهذه الدورة.");
-                areasOutOfSeeds.add(targetWithdrawArea.getName());
-                currentStage = FarmStage.HARVEST;
-                currentAreaIndex = (currentAreaIndex + 1) % FarmAreaManager.getInstance().getActiveAreas().size();
+                advanceOrFinishWithdraw(client, level, "لا توجد بذور (" + targetWithdrawCrop.getArabicName() + ") في هذا الصندوق!");
             }
-
-            targetWithdrawArea = null;
-            targetWithdrawCrop = null;
-            withdrawTimeoutTicks = 0;
-            cooldownTicks = 15;
             return;
         } else {
             withdrawCloseDelay = 0;
@@ -2454,38 +2223,12 @@ public class FarmBotController {
         // مهلة الوصول للصندوق (20 ثانية = 400 نبضة)
         withdrawTimeoutTicks++;
         if (withdrawTimeoutTicks > 400) {
-            sendChatMessage(client, "§c[Bot] تعذر فتح صندوق مزرعة §e" + targetWithdrawArea.getName() + "§c لسحب البذور! تجاوز المزرعة.");
-            areasOutOfSeeds.add(targetWithdrawArea.getName());
-            targetWithdrawArea = null;
-            targetWithdrawCrop = null;
-            withdrawTimeoutTicks = 0;
-            currentStage = FarmStage.HARVEST;
-            currentAreaIndex = (currentAreaIndex + 1) % FarmAreaManager.getInstance().getActiveAreas().size();
+            advanceOrFinishWithdraw(client, level, "تعذر فتح هذا الصندوق لسحب البذور!");
             return;
         }
 
-        double distSq = player.distanceToSqr(chestCenterX, chestCenterY, chestCenterZ);
-        if (distSq > 2.8 * 2.8) {
-            navigateTowards(client, player, level, chestPos, chestCenterX, chestCenterY, chestCenterZ, 2.5);
-        } else {
-            currentPath = null;
-            currentGoal = null;
-            if (isDriving) {
-                releaseControls(client);
-                isDriving = false;
-            }
-
-            smoothLookAt(player, chestCenterX, chestCenterY, chestCenterZ, ROTATION_SPEED);
-
-            BlockHitResult hit = new BlockHitResult(
-                new Vec3(chestCenterX, chestCenterY, chestCenterZ),
-                Direction.UP,
-                chestPos,
-                false
-            );
-            gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
-            player.swing(InteractionHand.MAIN_HAND);
-            cooldownTicks = 15; // انتظار استجابة السيرفر وفتح الحاوية
+        if (!navigateAndOpenContainer(client, player, level, gameMode, targetWithdrawChestPos)) {
+            advanceOrFinishWithdraw(client, level, "الصندوق المحدد لسحب البذور غير موجود في مكانه!");
         }
     }
 
@@ -2516,22 +2259,83 @@ public class FarmBotController {
         return totalWithdrawn;
     }
 
+    private boolean tryStartDepositCycle(
+            Minecraft client,
+            LocalPlayer player,
+            ClientLevel level,
+            List<FarmArea> activeAreas,
+            String reasonPrefix) {
+        visitedDepositChests.clear();
+        activeDepositPlan = null;
+        attemptedOutputChestsCrops.clear();
+        attemptedSeedChestsCrops.clear();
+        clearOverflowFullCrops();
+
+        DepositStop stop = findNextDepositStop(player, level, activeAreas, visitedDepositChests);
+        if (stop == null) {
+            return false;
+        }
+
+        applyDepositStop(stop);
+        currentStage = FarmStage.DEPOSIT;
+        resetNavPath();
+        depositTimeoutTicks = 0;
+        if (isDriving) {
+            releaseControls(client);
+            isDriving = false;
+        }
+        sendChatMessage(client, "§e[Bot] " + reasonPrefix + "! يتوجه الآن إلى صندوق §b"
+            + stop.role().getArabicLabel() + "§e لمزرعة §a" + stop.area().getName()
+            + "§e مع الاحتفاظ بـ 64 بذرة...");
+        return true;
+    }
+
+    private void applyDepositStop(DepositStop stop) {
+        targetDepositArea = stop.area();
+        targetDepositChestPos = stop.chestPos();
+        targetDepositRole = stop.role();
+        activeDepositPlan = stop.plan();
+    }
+
+    private void recordAttemptedDepositPlan(DepositPlan plan, List<FarmArea> activeAreas, ClientLevel level) {
+        if (plan == null) return;
+        attemptedOutputChestsCrops.addAll(plan.targetOutputCrops());
+        attemptedSeedChestsCrops.addAll(plan.targetSeedCrops());
+        if (plan.allowUnmappedOutputs() || plan.allowUnmappedSeeds()) {
+            for (FarmCrop workingCrop : getActiveWorkingCrops(level, activeAreas)) {
+                if (plan.allowUnmappedOutputs() && !plan.excludedOutputCropsWithOtherChests().contains(workingCrop)) {
+                    attemptedOutputChestsCrops.add(workingCrop);
+                }
+                if (plan.allowUnmappedSeeds() && workingCrop.hasDistinctSeedItem()
+                        && !plan.excludedSeedCropsWithOtherChests().contains(workingCrop)) {
+                    attemptedSeedChestsCrops.add(workingCrop);
+                }
+            }
+        }
+    }
+
+    private void clearOverflowFullCrops() {
+        fullOutputChestCrops.clear();
+        fullSeedChestCrops.clear();
+    }
+
+    private boolean hasOverflowFullCrops() {
+        return !fullOutputChestCrops.isEmpty() || !fullSeedChestCrops.isEmpty();
+    }
+
     /**
-     * معالجة الذهاب إلى الصندوق وتفريغ المحاصيل الزائدة مع الاحتفاظ بـ 64 حبة،
-     * مع التأكد التام من وضع كل نوع محصول في صندوقه المخصص دون خلط.
+     * معالجة الذهاب إلى الصندوق وتفريغ المحاصيل والبذور الفائضة مع الاحتفاظ بـ 64 بذرة،
+     * ودعم تعدد الصناديق وفصل صندوق البذور عن صندوق المحصول دون خلط.
      */
     private void handleDepositStage(Minecraft client, LocalPlayer player, ClientLevel level, MultiPlayerGameMode gameMode) {
-        if (targetDepositArea == null || targetDepositArea.getChestPos() == null) {
+        if (targetDepositArea == null || targetDepositChestPos == null) {
             targetDepositArea = null;
+            targetDepositChestPos = null;
+            activeDepositPlan = null;
             visitedDepositChests.clear();
             currentStage = FarmStage.HARVEST;
             return;
         }
-
-        BlockPos chestPos = targetDepositArea.getChestPos();
-        double chestCenterX = chestPos.getX() + 0.5;
-        double chestCenterY = chestPos.getY() + 0.5;
-        double chestCenterZ = chestPos.getZ() + 0.5;
 
         // إذا كان الصندوق مفتوحاً بالفعل (شاشة الحاوية مفتوحة)
         if (player.containerMenu != null && player.containerMenu != player.inventoryMenu) {
@@ -2540,14 +2344,10 @@ public class FarmBotController {
                 isDriving = false;
             }
 
+            List<FarmArea> activeAreas = FarmAreaManager.getInstance().getActiveAreas();
             if (depositCloseDelay == 0) {
-                List<FarmArea> activeAreas = FarmAreaManager.getInstance().getActiveAreas();
-                DepositPlan plan = buildDepositPlan(targetDepositArea, activeAreas, level, visitedDepositChests);
-                lastDepositTargetCrops.clear();
-                lastDepositTargetCrops.addAll(plan.targetCrops());
-                lastDepositExcludedCrops.clear();
-                lastDepositExcludedCrops.addAll(plan.excludedCropsWithOtherChests());
-                lastDepositAllowUnmappedFarmItems = plan.allowUnmappedFarmItems();
+                DepositPlan plan = buildDepositPlan(targetDepositChestPos, activeAreas, level, visitedDepositChests);
+                activeDepositPlan = plan;
                 lastDepositedCount = depositSurplusIntoOpenChest(player, gameMode, plan);
                 depositCloseDelay = 4; // انتظار 4 نبضات لضمان معالجة السيرفر لحزم الإيداع
                 return;
@@ -2559,48 +2359,29 @@ public class FarmBotController {
             }
 
             depositCloseDelay = 0;
-            // إغلاق الصندوق بعد الانتهاء من إيداع المحاصيل المحددة له
             player.closeContainer();
 
-            int deposited = lastDepositedCount;
+            DepositPlan usedPlan = activeDepositPlan != null
+                ? activeDepositPlan
+                : buildDepositPlan(targetDepositChestPos, activeAreas, level, visitedDepositChests);
+            recordAttemptedDepositPlan(usedPlan, activeAreas, level);
+            markChestVisited(level, visitedDepositChests, targetDepositChestPos);
 
-            // فحص هل بقي فائض لأي من المحاصيل التي كان ينبغي وضعها في هذا الصندوق (الصندوق ممتلئ)
-            Set<FarmCrop> checkedCrops = EnumSet.noneOf(FarmCrop.class);
-            checkedCrops.addAll(lastDepositTargetCrops);
-            if (lastDepositAllowUnmappedFarmItems) {
-                for (FarmCrop c : FarmCrop.values()) {
-                    if (!lastDepositExcludedCrops.contains(c)) {
-                        checkedCrops.add(c);
-                    }
-                }
-            }
-            for (FarmCrop crop : checkedCrops) {
-                if (hasCropSurplus(player, crop)) {
-                    fullChestCrops.add(crop);
-                    sendChatMessage(client, "§6[Bot] صندوق مزرعة §e" + targetDepositArea.getName() + "§6 ممتلئ ولا يتسع لفائض محصول §e" + crop.getArabicName() + "§6!");
-                }
-            }
-
-            if (deposited > 0) {
-                sendChatMessage(client, "§a[Bot] تم تفريغ فائض المحاصيل (" + deposited + " حزمة) في صندوق مزرعة §e" + targetDepositArea.getName() + "§a بنجاح مع الاحتفاظ بـ 64 بذرة!");
+            if (lastDepositedCount > 0) {
+                sendChatMessage(client, "§a[Bot] تم تفريغ (" + lastDepositedCount + " حزمة) في صندوق §b"
+                    + targetDepositRole.getArabicLabel() + "§a لمزرعة §e" + targetDepositArea.getName() + "§a بنجاح!");
             } else {
-                sendChatMessage(client, "§e[Bot] تم فحص صندوق مزرعة §e" + targetDepositArea.getName() + "§e؛ لا توجد محاصيل إضافية لتفريغها أو الصندوق ممتلئ!");
+                sendChatMessage(client, "§e[Bot] تم فحص صندوق §b" + targetDepositRole.getArabicLabel()
+                    + "§e لمزرعة §e" + targetDepositArea.getName() + "§e؛ لا توجد عناصر مناسبة إضافية أو الصندوق ممتلئ!");
             }
 
-            // إضافة هذا الصندوق لقائمة الصناديق التي تمت زيارتها في هذه الجولة لمنع تكراره
-            visitedDepositChests.add(chestPos);
-
-            // فحص هل ما زال لدى اللاعب محاصيل أخرى فائضة تنتمي لصناديق مزارع أخرى لم نزرها بعد
-            List<FarmArea> activeAreas = FarmAreaManager.getInstance().getActiveAreas();
-            FarmArea nextFarm = findAreaNeedingDeposit(player, level, activeAreas, visitedDepositChests);
-
-            if (nextFarm != null) {
-                // الانتقال فوراً للصندوق التالي
-                sendChatMessage(client, "§6[Bot] يتوجه الآن إلى صندوق مزرعة §e" + nextFarm.getName() + "§6 لتفريغ باقي المحاصيل...");
-                targetDepositArea = nextFarm;
+            DepositStop nextStop = findNextDepositStop(player, level, activeAreas, visitedDepositChests);
+            if (nextStop != null) {
+                sendChatMessage(client, "§6[Bot] يتوجه الآن إلى صندوق §b" + nextStop.role().getArabicLabel()
+                    + "§6 التالي لمزرعة §e" + nextStop.area().getName() + "§6 لتفريغ الباقي...");
+                applyDepositStop(nextStop);
                 depositTimeoutTicks = 0;
-                currentPath = null;
-                currentGoal = null;
+                resetNavPath();
                 cooldownTicks = 15;
                 return;
             }
@@ -2611,46 +2392,28 @@ public class FarmBotController {
             depositCloseDelay = 0;
         }
 
-        // إذا لم يكن الصندوق مفتوحاً بعد، نتحرك نحوه مع مراقبة الوقت
+        // إذا لم يكن الصندوق مفتوحاً بعد، نتحرك نحوه مع مراقبة الوقت وتوفر البلوكة
         depositTimeoutTicks++;
-        if (depositTimeoutTicks > 400) { // بعد 20 ثانية دون الوصول
-            sendChatMessage(client, "§c[Bot] تعذر فتح صندوق مزرعة §e" + targetDepositArea.getName() + "§c! فحص الصناديق التالية...");
-            visitedDepositChests.add(chestPos);
+        boolean blockOk = navigateAndOpenContainer(client, player, level, gameMode, targetDepositChestPos);
+        if (!blockOk || depositTimeoutTicks > 400) {
+            String reason = !blockOk ? "الصندوق غير موجود في مكانه!" : "تعذر فتح الصندوق!";
+            sendChatMessage(client, "§c[Bot] " + reason + " (صندوق §b" + targetDepositRole.getArabicLabel()
+                + "§c لمزرعة §e" + targetDepositArea.getName() + "§c) - فحص الصناديق التالية...");
             List<FarmArea> activeAreas = FarmAreaManager.getInstance().getActiveAreas();
-            FarmArea nextFarm = findAreaNeedingDeposit(player, level, activeAreas, visitedDepositChests);
-            if (nextFarm != null) {
-                targetDepositArea = nextFarm;
+            DepositPlan skippedPlan = activeDepositPlan != null
+                ? activeDepositPlan
+                : buildDepositPlan(targetDepositChestPos, activeAreas, level, visitedDepositChests);
+            recordAttemptedDepositPlan(skippedPlan, activeAreas, level);
+            markChestVisited(level, visitedDepositChests, targetDepositChestPos);
+
+            DepositStop nextStop = findNextDepositStop(player, level, activeAreas, visitedDepositChests);
+            if (nextStop != null) {
+                applyDepositStop(nextStop);
                 depositTimeoutTicks = 0;
-                currentPath = null;
-                currentGoal = null;
+                resetNavPath();
                 return;
             }
             handlePostDepositFullChests(client, player, level, activeAreas);
-            return;
-        }
-
-        double distSq = player.distanceToSqr(chestCenterX, chestCenterY, chestCenterZ);
-        if (distSq > 2.8 * 2.8) {
-            navigateTowards(client, player, level, chestPos, chestCenterX, chestCenterY, chestCenterZ, 2.5);
-        } else {
-            currentPath = null;
-            currentGoal = null;
-            if (isDriving) {
-                releaseControls(client);
-                isDriving = false;
-            }
-
-            smoothLookAt(player, chestCenterX, chestCenterY, chestCenterZ, ROTATION_SPEED);
-
-            BlockHitResult hit = new BlockHitResult(
-                new Vec3(chestCenterX, chestCenterY, chestCenterZ),
-                Direction.UP,
-                chestPos,
-                false
-            );
-            gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
-            player.swing(InteractionHand.MAIN_HAND);
-            cooldownTicks = 15; // انتظار فتح الحاوية
         }
     }
 
@@ -2726,44 +2489,85 @@ public class FarmBotController {
             || item == net.minecraft.world.item.Items.NETHER_WART;
     }
 
+    private static boolean isOtherSeedMiscItem(Item item) {
+        return item == Items.PUMPKIN_SEEDS
+            || item == Items.MELON_SEEDS
+            || item == Items.TORCHFLOWER_SEEDS
+            || item == Items.PITCHER_POD;
+    }
+
+    private static FarmCrop getCropForOutputItem(Item item) {
+        if (item == null) return null;
+        if (item == Items.WHEAT) return FarmCrop.WHEAT;
+        if (item == Items.BEETROOT) return FarmCrop.BEETROOT;
+        if (item == Items.CARROT) return FarmCrop.CARROT;
+        if (item == Items.POTATO || item == Items.POISONOUS_POTATO) return FarmCrop.POTATO;
+        if (item == Items.NETHER_WART) return FarmCrop.NETHER_WART;
+        return null;
+    }
+
+    private static FarmCrop getCropForDistinctSeedItem(Item item) {
+        if (item == null) return null;
+        if (item == Items.WHEAT_SEEDS) return FarmCrop.WHEAT;
+        if (item == Items.BEETROOT_SEEDS) return FarmCrop.BEETROOT;
+        return null;
+    }
+
     private void handlePostDepositFullChests(
             Minecraft client,
             LocalPlayer player,
             ClientLevel level,
             List<FarmArea> activeAreas) {
-        if (!fullChestCrops.isEmpty() && hasAnyCompostableSurplus(player, fullChestCrops)) {
+        clearOverflowFullCrops();
+        for (FarmCrop c : attemptedOutputChestsCrops) {
+            if (hasCropOutputSurplus(player, c)) {
+                fullOutputChestCrops.add(c);
+                sendChatMessage(client, "§6[Bot] جميع صناديق محصول §e" + c.getArabicName() + "§6 ممتلئة أو متعذر فتحها!");
+            }
+        }
+        for (FarmCrop c : attemptedSeedChestsCrops) {
+            if (hasCropSeedSurplus(player, c)) {
+                fullSeedChestCrops.add(c);
+                sendChatMessage(client, "§6[Bot] جميع صناديق بذور §e" + c.getArabicName() + "§6 ممتلئة أو متعذر فتحها!");
+            }
+        }
+
+        if (hasOverflowFullCrops() && hasAnyCompostableSurplus(player)) {
             BlockPos composter = findNearbyComposter(player, level, 36);
             if (composter != null) {
-                sendChatMessage(client, "§e[Bot] لم يجد مساحة في صندوق المورد! يتوجه الآن إلى أقرب كومبوستر لتحويل الفائض إلى سماد...");
+                sendChatMessage(client, "§e[Bot] لم يجد مساحة في الصناديق المخصصة! يتوجه الآن إلى أقرب كومبوستر لتحويل الفائض إلى سماد...");
                 targetComposterPos = composter;
                 currentStage = FarmStage.COMPOST;
                 compostTimeoutTicks = 0;
-                currentPath = null;
-                currentGoal = null;
+                resetNavPath();
                 visitedDepositChests.clear();
-                lastDepositTargetCrops.clear();
-                lastDepositExcludedCrops.clear();
-                lastDepositAllowUnmappedFarmItems = false;
+                activeDepositPlan = null;
+                attemptedOutputChestsCrops.clear();
+                attemptedSeedChestsCrops.clear();
                 targetDepositArea = null;
+                targetDepositChestPos = null;
                 depositTimeoutTicks = 0;
                 cooldownTicks = 15;
                 return;
             }
-            sendChatMessage(client, "§c[Bot] صناديق الموارد ممتلئة ولكن لم يتم العثور على أي كومبوستر قريب في المحيط (نطاق 36 بلوكة)!");
+            sendChatMessage(client, "§c[Bot] الصناديق المخصصة ممتلئة ولكن لم يتم العثور على أي كومبوستر قريب في المحيط (نطاق 36 بلوكة)!");
         }
 
-        if (!fullChestCrops.isEmpty()) {
+        if (hasOverflowFullCrops()) {
             for (FarmArea area : activeAreas) {
                 Set<FarmCrop> areaCrops = getCropsInArea(level, area);
                 for (FarmCrop c : areaCrops) {
-                    if (fullChestCrops.contains(c)) {
+                    boolean outputAffected = !area.getCropChests().isEmpty() && fullOutputChestCrops.contains(c);
+                    boolean seedAffected = fullSeedChestCrops.contains(c)
+                        && (area.hasSeparateSeedChestsForCrop(c) || !area.getCropChests().isEmpty());
+                    if (outputAffected || seedAffected) {
                         fullChestPausedFarms.add(area.getName());
-                        sendChatMessage(client, "§c[Bot] تم إيقاف العمل في مزرعة §e" + area.getName() + "§c (" + c.getArabicName() + ") مؤقتاً لامتلاء صندوقها وعدم توفر أداة سماد لتفريغ الفائض.");
+                        sendChatMessage(client, "§c[Bot] تم إيقاف العمل في مزرعة §e" + area.getName() + "§c (" + c.getArabicName() + ") مؤقتاً لامتلاء الصناديق وعدم توفر أداة سماد لتفريغ الفائض.");
                         break;
                     }
                 }
             }
-            fullChestCrops.clear();
+            clearOverflowFullCrops();
 
             if (fullChestPausedFarms.containsAll(activeAreas.stream().map(FarmArea::getName).toList())) {
                 sendChatMessage(client, "§c[Bot] تم إيقاف جميع المزارع مؤقتاً لامتلاء صناديقها وعدم توفر أداة سماد! إيقاف البوت لحين إفراغ الصناديق.");
@@ -2772,16 +2576,17 @@ public class FarmBotController {
             }
         }
 
-        fullChestCrops.clear();
+        clearOverflowFullCrops();
         visitedDepositChests.clear();
-        lastDepositTargetCrops.clear();
-        lastDepositExcludedCrops.clear();
-        lastDepositAllowUnmappedFarmItems = false;
+        activeDepositPlan = null;
+        attemptedOutputChestsCrops.clear();
+        attemptedSeedChestsCrops.clear();
         targetDepositArea = null;
+        targetDepositChestPos = null;
         depositTimeoutTicks = 0;
         currentStage = FarmStage.HARVEST;
         cooldownTicks = 20;
-        sendChatMessage(client, "§a[Bot] اكتمل تفريغ كافة المحاصيل المحددة في الصناديق! استئناف دورة الزراعة...");
+        sendChatMessage(client, "§a[Bot] اكتمل تفريغ كافة المحاصيل والبذور في الصناديق! استئناف دورة الزراعة...");
     }
 
     /**
@@ -2833,68 +2638,153 @@ public class FarmBotController {
     }
 
     private DepositPlan buildDepositPlan(
-            FarmArea targetArea,
+            BlockPos chestPos,
             List<FarmArea> activeAreas,
             ClientLevel level,
             Set<BlockPos> excludedChests) {
-        if (targetArea == null || targetArea.getChestPos() == null) {
-            return new DepositPlan(EnumSet.noneOf(FarmCrop.class), EnumSet.noneOf(FarmCrop.class), false);
+        if (chestPos == null) {
+            return new DepositPlan(
+                EnumSet.noneOf(FarmCrop.class),
+                EnumSet.noneOf(FarmCrop.class),
+                EnumSet.noneOf(FarmCrop.class),
+                EnumSet.noneOf(FarmCrop.class),
+                false,
+                false
+            );
         }
 
-        BlockPos chestPos = targetArea.getChestPos();
-        Set<FarmCrop> cropsForChest = EnumSet.noneOf(FarmCrop.class);
-        boolean hasAutoAreaOnChest = false;
+        Set<FarmCrop> targetOutputCrops = EnumSet.noneOf(FarmCrop.class);
+        Set<FarmCrop> targetSeedCrops = EnumSet.noneOf(FarmCrop.class);
+        boolean actsAsCropChest = false;
+        boolean actsAsSeedChest = false;
+        boolean allowUnmappedOutputs = false;
+        boolean allowUnmappedSeeds = false;
+
+        Set<FarmCrop> outputsWithOtherUnvisitedChests = EnumSet.noneOf(FarmCrop.class);
+        Set<FarmCrop> seedsWithOtherUnvisitedChests = EnumSet.noneOf(FarmCrop.class);
+        Set<FarmCrop> cropsWithDedicatedSeedChests = EnumSet.noneOf(FarmCrop.class);
 
         if (activeAreas != null) {
             for (FarmArea area : activeAreas) {
                 if (fullChestPausedFarms.contains(area.getName())) continue;
-                if (chestPos.equals(area.getChestPos())) {
-                    cropsForChest.addAll(getCropsInArea(level, area));
+                Set<FarmCrop> areaCrops = getCropsInArea(level, area);
+                boolean hasDedicatedSeedChests = !area.getSeedChests().isEmpty();
+                boolean chestInCropList = FarmAreaManager.containsStorageContainer(level, area.getCropChests(), chestPos);
+                boolean chestInSeedList = FarmAreaManager.containsStorageContainer(level, area.getSeedChests(), chestPos);
+
+                if (chestInCropList) {
+                    actsAsCropChest = true;
+                    targetOutputCrops.addAll(areaCrops);
+                    if (!hasDedicatedSeedChests) {
+                        for (FarmCrop c : areaCrops) {
+                            if (c.hasDistinctSeedItem()) {
+                                targetSeedCrops.add(c);
+                            }
+                        }
+                    }
                     if (area.getTargetCrop() == null) {
-                        hasAutoAreaOnChest = true;
+                        allowUnmappedOutputs = true;
+                        if (!hasDedicatedSeedChests) {
+                            allowUnmappedSeeds = true;
+                        }
+                    }
+                }
+
+                if (chestInSeedList) {
+                    actsAsSeedChest = true;
+                    for (FarmCrop c : areaCrops) {
+                        if (c.hasDistinctSeedItem()) {
+                            targetSeedCrops.add(c);
+                        }
+                    }
+                    if (area.getTargetCrop() == null) {
+                        allowUnmappedSeeds = true;
+                    }
+                }
+
+                boolean hasOtherUnvisitedCropChest = area.getCropChests().stream()
+                    .anyMatch(c -> !FarmAreaManager.isSameStorageContainer(level, c, chestPos)
+                        && !isChestVisited(level, excludedChests, c));
+                if (hasOtherUnvisitedCropChest) {
+                    outputsWithOtherUnvisitedChests.addAll(areaCrops);
+                    if (!hasDedicatedSeedChests) {
+                        for (FarmCrop c : areaCrops) {
+                            if (c.hasDistinctSeedItem()) {
+                                seedsWithOtherUnvisitedChests.add(c);
+                            }
+                        }
+                    }
+                }
+
+                if (hasDedicatedSeedChests) {
+                    for (FarmCrop c : areaCrops) {
+                        if (c.hasDistinctSeedItem()) {
+                            cropsWithDedicatedSeedChests.add(c);
+                        }
+                    }
+                    boolean hasOtherUnvisitedSeedChest = area.getSeedChests().stream()
+                        .anyMatch(c -> !FarmAreaManager.isSameStorageContainer(level, c, chestPos)
+                            && !isChestVisited(level, excludedChests, c));
+                    if (hasOtherUnvisitedSeedChest) {
+                        for (FarmCrop c : areaCrops) {
+                            if (c.hasDistinctSeedItem()) {
+                                seedsWithOtherUnvisitedChests.add(c);
+                            }
+                        }
                     }
                 }
             }
         }
 
-        Set<FarmCrop> cropsWithOtherChests = EnumSet.noneOf(FarmCrop.class);
-        if (activeAreas != null) {
-            for (FarmArea area : activeAreas) {
-                if (fullChestPausedFarms.contains(area.getName())) continue;
-                BlockPos otherChest = area.getChestPos();
-                if (otherChest != null
-                        && !otherChest.equals(chestPos)
-                        && (excludedChests == null || !excludedChests.contains(otherChest))) {
-                    cropsWithOtherChests.addAll(getCropsInArea(level, area));
+        // إضافة المحاصيل العاملة التي لا تملك صندوقاً آخراً مستقلاً في هذه الجولة، مع احترام فصل البذور عن المحصول
+        Set<FarmCrop> workingCrops = getActiveWorkingCrops(level, activeAreas);
+        for (FarmCrop workingCrop : workingCrops) {
+            if (actsAsCropChest && !outputsWithOtherUnvisitedChests.contains(workingCrop)) {
+                targetOutputCrops.add(workingCrop);
+            }
+            if (workingCrop.hasDistinctSeedItem() && !seedsWithOtherUnvisitedChests.contains(workingCrop)) {
+                if (actsAsSeedChest || (actsAsCropChest && !cropsWithDedicatedSeedChests.contains(workingCrop))) {
+                    targetSeedCrops.add(workingCrop);
                 }
             }
         }
 
-        // إضافة كل المحاصيل التي يعمل عليها البوت الآن طالما لا تملك صندوقاً مستقلاً آخر غير مزور
-        for (FarmCrop workingCrop : getActiveWorkingCrops(level, activeAreas)) {
-            if (!cropsWithOtherChests.contains(workingCrop)) {
-                cropsForChest.add(workingCrop);
-            }
+        Set<FarmCrop> excludedSeeds = EnumSet.copyOf(seedsWithOtherUnvisitedChests);
+        if (!actsAsSeedChest) {
+            excludedSeeds.addAll(cropsWithDedicatedSeedChests);
         }
 
-        return new DepositPlan(cropsForChest, cropsWithOtherChests, hasAutoAreaOnChest);
+        return new DepositPlan(
+            targetOutputCrops,
+            targetSeedCrops,
+            outputsWithOtherUnvisitedChests,
+            excludedSeeds,
+            allowUnmappedOutputs,
+            allowUnmappedSeeds
+        );
     }
 
     private boolean shouldDepositItemWithPlan(Item item, DepositPlan plan) {
-        for (FarmCrop crop : plan.targetCrops()) {
-            if (doesItemBelongToCrop(item, crop)) {
+        FarmCrop distinctSeedCrop = getCropForDistinctSeedItem(item);
+        if (distinctSeedCrop != null) {
+            if (plan.targetSeedCrops().contains(distinctSeedCrop)) {
                 return true;
             }
+            return plan.allowUnmappedSeeds() && !plan.excludedSeedCropsWithOtherChests().contains(distinctSeedCrop);
         }
-        if (plan.allowUnmappedFarmItems()) {
-            for (FarmCrop excludedCrop : plan.excludedCropsWithOtherChests()) {
-                if (doesItemBelongToCrop(item, excludedCrop)) {
-                    return false;
-                }
+
+        FarmCrop outputCrop = getCropForOutputItem(item);
+        if (outputCrop != null) {
+            if (plan.targetOutputCrops().contains(outputCrop)) {
+                return true;
             }
-            return true;
+            return plan.allowUnmappedOutputs() && !plan.excludedOutputCropsWithOtherChests().contains(outputCrop);
         }
-        return false;
+
+        if (isOtherSeedMiscItem(item)) {
+            return plan.allowUnmappedSeeds();
+        }
+        return plan.allowUnmappedOutputs();
     }
 
     /**
@@ -3016,11 +2906,11 @@ public class FarmBotController {
     }
 
     /**
-     * البحث عن خانة تحتوي على عناصر أو بذور فائضة تنتمي لمحاصيل امتلأت صناديقها
+     * البحث عن خانة تحتوي على عناصر أو بذور فائضة تنتمي لمحاصيل أو بذور امتلأت صناديقها
      * بشرط أن تكون قابلة للتحويل لسماد، مع حماية 64 حبة للبذور القابلة للزراعة
      */
-    private int findCompostableSurplusSlot(LocalPlayer player, Set<FarmCrop> fullCrops) {
-        if (player == null || fullCrops == null || fullCrops.isEmpty()) return -1;
+    private int findCompostableSurplusSlot(LocalPlayer player) {
+        if (player == null || !hasOverflowFullCrops()) return -1;
         Inventory inv = player.getInventory();
         for (int i = 0; i < 36; i++) {
             ItemStack stack = inv.getItem(i);
@@ -3029,15 +2919,18 @@ public class FarmBotController {
             if (item == Items.BAKED_POTATO || BotFoodManager.getInstance().isAllowed(stack)) continue; // حماية طعام البوت دائماً
             if (!ComposterBlock.COMPOSTABLES.containsKey(item)) continue; // عنصر يقبله الكومبوستر
 
-            // فحص هل العنصر ينتمي لأحد المحاصيل التي امتلأت صناديقها
-            boolean belongsToFullCrop = false;
-            for (FarmCrop crop : fullCrops) {
-                if (doesItemBelongToCrop(item, crop)) {
-                    belongsToFullCrop = true;
-                    break;
+            // التمييز بين امتلاء صناديق البذور وامتلاء صناديق المحصول
+            FarmCrop distinctSeedCrop = getCropForDistinctSeedItem(item);
+            if (distinctSeedCrop != null) {
+                if (!fullSeedChestCrops.contains(distinctSeedCrop)) {
+                    continue;
+                }
+            } else {
+                FarmCrop outputCrop = getCropForOutputItem(item);
+                if (outputCrop == null || !fullOutputChestCrops.contains(outputCrop)) {
+                    continue;
                 }
             }
-            if (!belongsToFullCrop) continue;
 
             // إذا كان المحصول بذرة أو يزرع في الأرض، نحتفظ بـ 64 حبة على الأقل
             if (isPlantedSeed(item)) {
@@ -3052,8 +2945,8 @@ public class FarmBotController {
         return -1;
     }
 
-    private boolean hasAnyCompostableSurplus(LocalPlayer player, Set<FarmCrop> fullCrops) {
-        return findCompostableSurplusSlot(player, fullCrops) != -1;
+    private boolean hasAnyCompostableSurplus(LocalPlayer player) {
+        return findCompostableSurplusSlot(player) != -1;
     }
 
     /**
@@ -3094,6 +2987,29 @@ public class FarmBotController {
         return best;
     }
 
+    private void approachDroppedBoneMeal(Minecraft client, LocalPlayer player, ClientLevel level, ItemEntity droppedBoneMeal) {
+        if (droppedBoneMeal == null) return;
+        trackedGoalPos = droppedBoneMeal.blockPosition();
+        BotNavigator.NavResult navRes = farmNavigator.navigateTo(
+            client,
+            player,
+            level,
+            client.gameMode,
+            droppedBoneMeal.position(),
+            false,
+            0.25,
+            isEating,
+            ROTATION_SPEED,
+            true,
+            1500,
+            FarmPathfinder.PathOptions.FARM_DEFAULT,
+            true,
+            true,
+            null
+        );
+        isDriving = (navRes == BotNavigator.NavResult.MOVING);
+    }
+
     /**
      * معالجة مرحلة الذهاب إلى الكومبوستر ووضع البذور/العناصر الفائضة لإنتاج السماد وجمعه في النهاية
      */
@@ -3105,15 +3021,14 @@ public class FarmBotController {
             if (droppedBoneMeal != null && collectBoneMealTicks < 60) {
                 collectBoneMealTicks++;
                 smoothLookAt(player, droppedBoneMeal.getX(), droppedBoneMeal.getY() + 0.2, droppedBoneMeal.getZ(), ROTATION_SPEED);
-                moveTo(client, player, level, droppedBoneMeal.getX(), droppedBoneMeal.getY(), droppedBoneMeal.getZ(), 0.2);
+                approachDroppedBoneMeal(client, player, level, droppedBoneMeal);
                 return;
             }
             collectBoneMealTicks = 0;
             sendChatMessage(client, "§e[Bot] تم جمع ستاك كامل (64) من السماد! يتوجه البوت الآن لتفريغه في صندوق السماد...");
             currentStage = FarmStage.DEPOSIT_FERTILIZER;
             fertilizerTimeoutTicks = 0;
-            currentPath = null;
-            currentGoal = null;
+            resetNavPath();
             if (isDriving) {
                 releaseControls(client);
                 isDriving = false;
@@ -3125,7 +3040,7 @@ public class FarmBotController {
             targetComposterPos = findNearbyComposter(player, level, 36);
             if (targetComposterPos == null) {
                 sendChatMessage(client, "§c[Bot] تعذر العثور على أي كومبوستر في المحيط (نطاق 36 بلوكة)!");
-                fullChestCrops.clear();
+                clearOverflowFullCrops();
                 currentStage = FarmStage.HARVEST;
                 return;
             }
@@ -3147,7 +3062,7 @@ public class FarmBotController {
             compostTimeoutTicks++;
             if (compostTimeoutTicks > 400) {
                 sendChatMessage(client, "§c[Bot] تعذر الوصول للكومبوستر بعد 20 ثانية! إلغاء واستئناف العمل...");
-                fullChestCrops.clear();
+                clearOverflowFullCrops();
                 targetComposterPos = null;
                 currentStage = FarmStage.HARVEST;
                 compostTimeoutTicks = 0;
@@ -3155,8 +3070,7 @@ public class FarmBotController {
             return;
         }
 
-        currentPath = null;
-        currentGoal = null;
+        resetNavPath();
         if (isDriving) {
             releaseControls(client);
             isDriving = false;
@@ -3186,7 +3100,7 @@ public class FarmBotController {
         }
 
         // فحص هل توجد عناصر أو بذور فائضة لإضافتها في الكومبوستر (< 8)
-        int slot = findCompostableSurplusSlot(player, fullChestCrops);
+        int slot = findCompostableSurplusSlot(player);
         if (slot == -1) {
             // لم يتبق أي فائض من المحاصيل لوضعه في الكومبوستر.
             // 1. مرحلة النهاية: استخراج السماد إن كان الكومبوستر مكتملاً (المستوى 8)
@@ -3210,8 +3124,9 @@ public class FarmBotController {
                 double itemDistSq = player.distanceToSqr(droppedBoneMeal);
                 smoothLookAt(player, droppedBoneMeal.getX(), droppedBoneMeal.getY() + 0.2, droppedBoneMeal.getZ(), ROTATION_SPEED);
                 if (itemDistSq > 0.4 * 0.4) {
-                    moveTo(client, player, level, droppedBoneMeal.getX(), droppedBoneMeal.getY(), droppedBoneMeal.getZ(), 0.2);
+                    approachDroppedBoneMeal(client, player, level, droppedBoneMeal);
                 } else {
+                    resetNavPath();
                     if (isDriving) {
                         releaseControls(client);
                         isDriving = false;
@@ -3228,7 +3143,7 @@ public class FarmBotController {
             }
 
             sendChatMessage(client, "§a[Bot] تم تحويل كامل الفائض وجمع السماد من الكومبوستر بنجاح! (" + countItemInInventory(player, Items.BONE_MEAL) + " حبة سماد)");
-            fullChestCrops.clear();
+            clearOverflowFullCrops();
             targetComposterPos = null;
             compostTimeoutTicks = 0;
             cooldownTicks = 20;
@@ -3290,10 +3205,6 @@ public class FarmBotController {
             return;
         }
 
-        double cx = chestPos.getX() + 0.5;
-        double cy = chestPos.getY() + 0.5;
-        double cz = chestPos.getZ() + 0.5;
-
         // إذا كانت الحاوية مفتوحة بالفعل
         if (player.containerMenu != null && player.containerMenu != player.inventoryMenu) {
             if (isDriving) {
@@ -3314,46 +3225,24 @@ public class FarmBotController {
             cooldownTicks = 20;
 
             // إذا كان لا يزال هناك فائض محاصيل بحاجة للتحويل لسماد نعود للكومبوستر
-            if (!fullChestCrops.isEmpty() && hasAnyCompostableSurplus(player, fullChestCrops)) {
+            if (hasOverflowFullCrops() && hasAnyCompostableSurplus(player)) {
                 currentStage = FarmStage.COMPOST;
                 compostTimeoutTicks = 0;
             } else {
-                fullChestCrops.clear();
+                clearOverflowFullCrops();
                 currentStage = FarmStage.HARVEST;
             }
             return;
         }
 
         fertilizerTimeoutTicks++;
-        if (fertilizerTimeoutTicks > 400) {
-            sendChatMessage(client, "§c[Bot] تعذر فتح صندوق السماد بعد 20 ثانية! العودة للزراعة...");
+        boolean blockOk = navigateAndOpenContainer(client, player, level, gameMode, chestPos);
+        if (!blockOk || fertilizerTimeoutTicks > 400) {
+            sendChatMessage(client, !blockOk
+                ? "§c[Bot] صندوق السماد المحدد غير موجود في مكانه! العودة للزراعة..."
+                : "§c[Bot] تعذر فتح صندوق السماد بعد 20 ثانية! العودة للزراعة...");
             currentStage = FarmStage.HARVEST;
             fertilizerTimeoutTicks = 0;
-            return;
-        }
-
-        double distSq = player.distanceToSqr(cx, cy, cz);
-        if (distSq > 2.8 * 2.8) {
-            navigateTowards(client, player, level, chestPos, cx, cy, cz, 2.5);
-        } else {
-            currentPath = null;
-            currentGoal = null;
-            if (isDriving) {
-                releaseControls(client);
-                isDriving = false;
-            }
-
-            smoothLookAt(player, cx, cy, cz, ROTATION_SPEED);
-
-            BlockHitResult hit = new BlockHitResult(
-                new Vec3(cx, cy, cz),
-                Direction.UP,
-                chestPos,
-                false
-            );
-            gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
-            player.swing(InteractionHand.MAIN_HAND);
-            cooldownTicks = 15;
         }
     }
 
@@ -3368,54 +3257,86 @@ public class FarmBotController {
         return true;
     }
 
-    private FarmArea findAreaNeedingDeposit(LocalPlayer player, ClientLevel level, List<FarmArea> areas, Set<BlockPos> excludedChests) {
+    private DepositStop findNextDepositStop(
+            LocalPlayer player,
+            ClientLevel level,
+            List<FarmArea> areas,
+            Set<BlockPos> excludedChests) {
         if (areas == null || areas.isEmpty() || player == null) return null;
 
-        // 1. فحص المزرعة الحالية أولاً إذا كان لها صندوق غير مزور وفيه فائض من المحاصيل التي يقبلها هذا الصندوق
+        // 1. فحص صناديق المزرعة الحالية أولاً بالترتيب (المحصول ثم البذور)
         if (currentAreaIndex < areas.size()) {
-            FarmArea current = areas.get(currentAreaIndex);
-            if (canAreaAcceptDeposit(player, level, current, areas, excludedChests)) {
-                return current;
+            DepositStop currentStop = findFirstEligibleStopInArea(player, level, areas.get(currentAreaIndex), areas, excludedChests);
+            if (currentStop != null) {
+                return currentStop;
             }
         }
 
-        // 2. فحص بقية المزارع المفعلة المرتبطة بصناديق متاحة لأي محصول يعمل عليه البوت الآن
+        // 2. فحص صناديق بقية المزارع المفعلة
         for (FarmArea area : areas) {
-            if (canAreaAcceptDeposit(player, level, area, areas, excludedChests)) {
-                return area;
+            DepositStop stop = findFirstEligibleStopInArea(player, level, area, areas, excludedChests);
+            if (stop != null) {
+                return stop;
             }
         }
 
         return null;
     }
 
-    private FarmArea findAreaNeedingDeposit(LocalPlayer player, ClientLevel level, List<FarmArea> areas) {
-        return findAreaNeedingDeposit(player, level, areas, visitedDepositChests);
-    }
-
-    private boolean canAreaAcceptDeposit(
+    private DepositStop findFirstEligibleStopInArea(
             LocalPlayer player,
             ClientLevel level,
             FarmArea area,
             List<FarmArea> activeAreas,
             Set<BlockPos> excludedChests) {
-        if (area == null || area.getChestPos() == null || fullChestPausedFarms.contains(area.getName())) {
-            return false;
+        if (area == null || fullChestPausedFarms.contains(area.getName())) {
+            return null;
         }
-        if (excludedChests != null && excludedChests.contains(area.getChestPos())) {
-            return false;
+        for (BlockPos cropChest : area.getCropChests()) {
+            if (isChestVisited(level, excludedChests, cropChest)) continue;
+            DepositPlan plan = buildDepositPlan(cropChest, activeAreas, level, excludedChests);
+            if (doesPlanMatchInventorySurplus(player, plan)) {
+                return new DepositStop(area, cropChest, FarmArea.ChestRole.CROP, plan);
+            }
         }
+        for (BlockPos seedChest : area.getSeedChests()) {
+            if (isChestVisited(level, excludedChests, seedChest)) continue;
+            DepositPlan plan = buildDepositPlan(seedChest, activeAreas, level, excludedChests);
+            if (doesPlanMatchInventorySurplus(player, plan)) {
+                return new DepositStop(area, seedChest, FarmArea.ChestRole.SEED, plan);
+            }
+        }
+        return null;
+    }
 
-        DepositPlan plan = buildDepositPlan(area, activeAreas, level, excludedChests);
-        for (FarmCrop crop : plan.targetCrops()) {
-            if (hasCropSurplus(player, crop)) {
+    private boolean doesPlanMatchInventorySurplus(LocalPlayer player, DepositPlan plan) {
+        if (player == null || plan == null) return false;
+        for (FarmCrop crop : FarmCrop.values()) {
+            boolean acceptsOutput = plan.targetOutputCrops().contains(crop)
+                || (plan.allowUnmappedOutputs() && !plan.excludedOutputCropsWithOtherChests().contains(crop));
+            if (acceptsOutput && hasCropOutputSurplus(player, crop)) {
+                return true;
+            }
+            boolean acceptsSeed = crop.hasDistinctSeedItem() && (plan.targetSeedCrops().contains(crop)
+                || (plan.allowUnmappedSeeds() && !plan.excludedSeedCropsWithOtherChests().contains(crop)));
+            if (acceptsSeed && hasCropSeedSurplus(player, crop)) {
                 return true;
             }
         }
-        if (plan.allowUnmappedFarmItems()) {
-            for (FarmCrop crop : FarmCrop.values()) {
-                if (!plan.excludedCropsWithOtherChests().contains(crop) && hasCropSurplus(player, crop)) {
-                    return true;
+        if (plan.allowUnmappedOutputs() || plan.allowUnmappedSeeds()) {
+            Inventory inv = player.getInventory();
+            for (int i = 0; i < 36; i++) {
+                ItemStack stack = inv.getItem(i);
+                if (stack.isEmpty()) continue;
+                Item item = stack.getItem();
+                if (isFarmDepositItem(item)
+                        && getCropForOutputItem(item) == null
+                        && getCropForDistinctSeedItem(item) == null
+                        && !isPlantedSeed(item)) {
+                    boolean miscSeed = isOtherSeedMiscItem(item);
+                    if ((miscSeed && plan.allowUnmappedSeeds()) || (!miscSeed && plan.allowUnmappedOutputs())) {
+                        return true;
+                    }
                 }
             }
         }
@@ -3423,25 +3344,41 @@ public class FarmBotController {
     }
 
     private record DepositPlan(
-            Set<FarmCrop> targetCrops,
-            Set<FarmCrop> excludedCropsWithOtherChests,
-            boolean allowUnmappedFarmItems) {}
+            Set<FarmCrop> targetOutputCrops,
+            Set<FarmCrop> targetSeedCrops,
+            Set<FarmCrop> excludedOutputCropsWithOtherChests,
+            Set<FarmCrop> excludedSeedCropsWithOtherChests,
+            boolean allowUnmappedOutputs,
+            boolean allowUnmappedSeeds) {}
 
-    private boolean hasCropSurplus(LocalPlayer player, FarmCrop crop) {
+    private record DepositStop(
+            FarmArea area,
+            BlockPos chestPos,
+            FarmArea.ChestRole role,
+            DepositPlan plan) {}
+
+    private static boolean hasCropOutputSurplus(LocalPlayer player, FarmCrop crop) {
         if (crop == null || player == null) return false;
         return switch (crop) {
-            case WHEAT -> countItemInInventory(player, net.minecraft.world.item.Items.WHEAT) > 0
-                || countItemInInventory(player, net.minecraft.world.item.Items.WHEAT_SEEDS) > 64;
-            case BEETROOT -> countItemInInventory(player, net.minecraft.world.item.Items.BEETROOT) > 0
-                || countItemInInventory(player, net.minecraft.world.item.Items.BEETROOT_SEEDS) > 64;
-            case POTATO -> countItemInInventory(player, net.minecraft.world.item.Items.POTATO) > 64
-                || countItemInInventory(player, net.minecraft.world.item.Items.POISONOUS_POTATO) > 0;
-            case CARROT -> countItemInInventory(player, net.minecraft.world.item.Items.CARROT) > 64;
-            case NETHER_WART -> countItemInInventory(player, net.minecraft.world.item.Items.NETHER_WART) > 64;
+            case WHEAT -> countItemInInventory(player, Items.WHEAT) > 0;
+            case BEETROOT -> countItemInInventory(player, Items.BEETROOT) > 0;
+            case POTATO -> countItemInInventory(player, Items.POTATO) > 64
+                || countItemInInventory(player, Items.POISONOUS_POTATO) > 0;
+            case CARROT -> countItemInInventory(player, Items.CARROT) > 64;
+            case NETHER_WART -> countItemInInventory(player, Items.NETHER_WART) > 64;
         };
     }
 
-    private int countItemInInventory(LocalPlayer player, net.minecraft.world.item.Item item) {
+    private static boolean hasCropSeedSurplus(LocalPlayer player, FarmCrop crop) {
+        if (crop == null || player == null || !crop.hasDistinctSeedItem()) return false;
+        return switch (crop) {
+            case WHEAT -> countItemInInventory(player, Items.WHEAT_SEEDS) > 64;
+            case BEETROOT -> countItemInInventory(player, Items.BEETROOT_SEEDS) > 64;
+            default -> false;
+        };
+    }
+
+    private static int countItemInInventory(LocalPlayer player, net.minecraft.world.item.Item item) {
         if (item == null) return 0;
         Inventory inv = player.getInventory();
         int count = 0;
@@ -3523,8 +3460,7 @@ public class FarmBotController {
         if (!isEvadingThreat) {
             isEvadingThreat = true;
             evadeTicks = 0;
-            currentPath = null;
-            currentGoal = null;
+            resetNavPath();
             lockedItem = null;
             lastTargetPos = null;
             doingFinalVerification = false;

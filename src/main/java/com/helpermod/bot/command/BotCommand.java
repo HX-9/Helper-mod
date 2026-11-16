@@ -80,10 +80,10 @@ public class BotCommand {
         BotCommandHelpers.send(source, "§e/bot farm [start|stop|status] §7- تشغيل أو إيقاف أو عرض حالة بوت الزراعة");
         BotCommandHelpers.send(source, "§e/bot farm sleep [on|off] §7- تفعيل/تعطيل النوم التلقائي بعد 20 ثانية من الليل");
         BotCommandHelpers.send(source, "§e/bot farm bed [set|clear] §7- تعيين أو إلغاء أو عرض سرير نقطة الإحياء");
-        BotCommandHelpers.send(source, "§e/bot farm fertilizer [chest [set|clear]] §7- تعيين أو إلغاء أو عرض صندوق السماد (Bone Meal)");
+        BotCommandHelpers.send(source, "§e/bot farm fertilizer [chest [set|open|here|clear]] §7- تعيين أو إلغاء أو عرض صندوق السماد (Bone Meal)");
         BotCommandHelpers.send(source, "§e/bot farm area [pos1|pos2|create|add|edit|remove|list|enable|disable|select] §7- إدارة المناطق الزراعية");
         BotCommandHelpers.send(source, "§e/bot farm area add <اسم> <x1> <y1> <z1> <x2> <y2> <z2> [محصول] §7- إضافة منطقة بالإحداثيات");
-        BotCommandHelpers.send(source, "§e/bot farm area edit <اسم> <name|crop|chest [here|clear]|bounds|enable|disable> §7- تعديل المزرعة");
+        BotCommandHelpers.send(source, "§e/bot farm area edit <اسم> <name|crop|chest [open|here|add|seed|crop|list|remove|clear]|bounds|enable|disable> §7- تعديل المزرعة");
         BotCommandHelpers.send(source, "§e/bot farm area enable|disable <اسم|all> §7- تفعيل أو تعطيل مزارع محددة");
         BotCommandHelpers.send(source, "§e/bot farm area select [اسم|all|none] §7- تحديد مزرعة واحدة فقط أو الكل أو لا أحد");
     }

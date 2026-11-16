@@ -3,13 +3,17 @@ package com.helpermod.bot;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.item.AxeItem;
 import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.BowItem;
+import net.minecraft.world.item.CrossbowItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.phys.AABB;
@@ -24,6 +28,8 @@ import java.util.function.ToIntFunction;
 public final class BotEquipmentHelper {
 
     public static final int OFFHAND_SLOT_INDEX = 40;
+    public static final float CRITICAL_TOTEM_HEALTH = 7.5f;
+    public static final float TOTEM_RELEASE_HEALTH = 11.0f;
 
     private BotEquipmentHelper() {}
 
@@ -117,6 +123,13 @@ public final class BotEquipmentHelper {
         if (predicate.test(player.getOffhandItem())) {
             return true;
         }
+        // حماية التوتم أثناء الخطر الحرج حتى لا يستبدله الدرع أو الفأس تلقائياً
+        if (player.getOffhandItem().is(Items.TOTEM_OF_UNDYING) && isCriticalHealthForTotem(player)) {
+            return false;
+        }
+        if (player.containerMenu != player.inventoryMenu) {
+            return false;
+        }
 
         int containerId = player.inventoryMenu.containerId;
         for (int i = 0; i < 9; i++) {
@@ -145,6 +158,12 @@ public final class BotEquipmentHelper {
             boolean hotbarFirst,
             boolean requireReadyCooldown) {
         if (player == null || gameMode == null) return false;
+        if (player.getOffhandItem().is(Items.TOTEM_OF_UNDYING) && isCriticalHealthForTotem(player)) {
+            return false;
+        }
+        if (player.containerMenu != player.inventoryMenu) {
+            return false;
+        }
 
         int containerId = player.inventoryMenu.containerId;
         if (hotbarFirst) {
@@ -332,10 +351,256 @@ public final class BotEquipmentHelper {
         }
         for (int i = 0; i < 9; i++) {
             var item = inv.getItem(i).getItem();
-            if (!(item instanceof BlockItem) && !(item instanceof AxeItem)) {
+            if (!(item instanceof BlockItem)
+                    && !(item instanceof AxeItem)
+                    && !(item instanceof BowItem)
+                    && !(item instanceof CrossbowItem)) {
                 return i;
             }
         }
         return -1;
+    }
+
+    // =========================================================================
+    // أسلحة المدى (القوس والنشاب) والدروع وتوتم البقاء
+    // =========================================================================
+
+    public static boolean isBow(ItemStack stack) {
+        return stack != null && !stack.isEmpty() && (stack.is(Items.BOW) || stack.getItem() instanceof BowItem);
+    }
+
+    public static boolean isCrossbow(ItemStack stack) {
+        return stack != null && !stack.isEmpty() && (stack.is(Items.CROSSBOW) || stack.getItem() instanceof CrossbowItem);
+    }
+
+    public static boolean isRangedWeapon(ItemStack stack) {
+        return isBow(stack) || isCrossbow(stack);
+    }
+
+    public static boolean isAmmoItem(ItemStack stack) {
+        return stack != null && !stack.isEmpty()
+            && (stack.is(Items.ARROW) || stack.is(Items.SPECTRAL_ARROW) || stack.is(Items.TIPPED_ARROW));
+    }
+
+    public static boolean hasAmmo(LocalPlayer player) {
+        if (player == null) return false;
+        return player.isCreative() || hasMatchingItem(player, BotEquipmentHelper::isAmmoItem, true);
+    }
+
+    /**
+     * تقييم السلاح بعيد المدى المتاح: النشاب المشحون (12+) ثم القوس (10+) ثم النشاب غير المشحون (8+).
+     */
+    public static int getRangedWeaponTier(ItemStack stack, boolean hasAmmoOrCreative) {
+        if (stack == null || stack.isEmpty()) return 0;
+        int enchantBonus = stack.isEnchanted() ? 1 : 0;
+        if (isCrossbow(stack)) {
+            if (CrossbowItem.isCharged(stack)) {
+                return 12 + enchantBonus;
+            }
+            return hasAmmoOrCreative ? (8 + enchantBonus) : 0;
+        }
+        if (isBow(stack)) {
+            return hasAmmoOrCreative ? (10 + enchantBonus) : 0;
+        }
+        return 0;
+    }
+
+    /**
+     * التحقق من امتلاك قوس بذخيرة أو نشاب مشحون أو بذخيرة في الحقيبة.
+     */
+    public static boolean hasUsableRangedWeapon(LocalPlayer player) {
+        if (player == null) return false;
+        boolean canFire = hasAmmo(player);
+        for (int i = 0; i < 36; i++) {
+            if (getRangedWeaponTier(player.getInventory().getItem(i), canFire) > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * تجهيز أفضل سلاح بعيد مدى صالح للإطلاق في اليد الرئيسية.
+     */
+    public static boolean ensureBestRangedInMainHand(
+            LocalPlayer player,
+            MultiPlayerGameMode gameMode,
+            int fallbackHotbarSlot) {
+        if (player == null || gameMode == null) return false;
+        boolean canFire = hasAmmo(player);
+        return ensureBestInMainHand(player, gameMode, stack -> getRangedWeaponTier(stack, canFire), 1, fallbackHotbarSlot);
+    }
+
+    public static boolean hasTotemInInventory(LocalPlayer player) {
+        return hasMatchingItem(player, stack -> stack.is(Items.TOTEM_OF_UNDYING), true);
+    }
+
+    /**
+     * تفعيل وضع الخطر الحرج لتوتم البقاء مع هيستيريسيس بين 7.5 و 11.0 لتفادي التذبذب السريع مع الدرع.
+     */
+    public static boolean isCriticalHealthForTotem(LocalPlayer player) {
+        if (player == null || player.isCreative() || !hasTotemInInventory(player)) {
+            return false;
+        }
+        float health = player.getHealth();
+        if (health <= CRITICAL_TOTEM_HEALTH) {
+            return true;
+        }
+        return player.getOffhandItem().is(Items.TOTEM_OF_UNDYING) && health < TOTEM_RELEASE_HEALTH;
+    }
+
+    public static boolean ensureTotemInOffhand(LocalPlayer player, MultiPlayerGameMode gameMode) {
+        return ensureInOffhand(player, gameMode, stack -> stack.is(Items.TOTEM_OF_UNDYING));
+    }
+
+    /**
+     * إرجاع رقم خانة الدرع داخل قائمة InventoryMenu (5 للرأس حتى 8 للقدمين).
+     */
+    public static int getArmorMenuSlot(EquipmentSlot slot) {
+        if (slot == null) return -1;
+        return switch (slot) {
+            case HEAD -> 5;
+            case CHEST -> 6;
+            case LEGS -> 7;
+            case FEET -> 8;
+            default -> -1;
+        };
+    }
+
+    /**
+     * تقييم جودة قطعة الدرع للخانة المحددة دون الاعتماد على فئة ArmorItem المحذوفة.
+     */
+    public static int getArmorTier(ItemStack stack, EquipmentSlot slot) {
+        if (stack == null || stack.isEmpty() || slot == null) return 0;
+        int baseTier = switch (slot) {
+            case HEAD -> {
+                if (stack.is(Items.NETHERITE_HELMET)) yield 70;
+                if (stack.is(Items.DIAMOND_HELMET)) yield 60;
+                if (stack.is(Items.IRON_HELMET)) yield 45;
+                if (stack.is(Items.TURTLE_HELMET)) yield 42;
+                if (stack.is(Items.CHAINMAIL_HELMET)) yield 30;
+                if (stack.is(Items.GOLDEN_HELMET)) yield 22;
+                if (stack.is(Items.LEATHER_HELMET)) yield 10;
+                yield getDynamicVanillaArmorTier(stack, "_helmet");
+            }
+            case CHEST -> {
+                if (stack.is(Items.NETHERITE_CHESTPLATE)) yield 70;
+                if (stack.is(Items.DIAMOND_CHESTPLATE)) yield 60;
+                if (stack.is(Items.IRON_CHESTPLATE)) yield 45;
+                if (stack.is(Items.CHAINMAIL_CHESTPLATE)) yield 30;
+                if (stack.is(Items.GOLDEN_CHESTPLATE)) yield 22;
+                if (stack.is(Items.LEATHER_CHESTPLATE)) yield 10;
+                yield getDynamicVanillaArmorTier(stack, "_chestplate");
+            }
+            case LEGS -> {
+                if (stack.is(Items.NETHERITE_LEGGINGS)) yield 70;
+                if (stack.is(Items.DIAMOND_LEGGINGS)) yield 60;
+                if (stack.is(Items.IRON_LEGGINGS)) yield 45;
+                if (stack.is(Items.CHAINMAIL_LEGGINGS)) yield 30;
+                if (stack.is(Items.GOLDEN_LEGGINGS)) yield 22;
+                if (stack.is(Items.LEATHER_LEGGINGS)) yield 10;
+                yield getDynamicVanillaArmorTier(stack, "_leggings");
+            }
+            case FEET -> {
+                if (stack.is(Items.NETHERITE_BOOTS)) yield 70;
+                if (stack.is(Items.DIAMOND_BOOTS)) yield 60;
+                if (stack.is(Items.IRON_BOOTS)) yield 45;
+                if (stack.is(Items.CHAINMAIL_BOOTS)) yield 30;
+                if (stack.is(Items.GOLDEN_BOOTS)) yield 22;
+                if (stack.is(Items.LEATHER_BOOTS)) yield 10;
+                yield getDynamicVanillaArmorTier(stack, "_boots");
+            }
+            default -> 0;
+        };
+        if (baseTier <= 0) return 0;
+        return baseTier + (stack.isEnchanted() ? 5 : 0);
+    }
+
+    private static int getDynamicVanillaArmorTier(ItemStack stack, String suffix) {
+        var id = BuiltInRegistries.ITEM.getKey(stack.getItem());
+        if (id != null && "minecraft".equals(id.getNamespace())) {
+            String path = id.getPath();
+            if (("copper" + suffix).equals(path)) {
+                return 35;
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * لبس أقوى درع متاح في الحقيبة لكل خانة (الرأس، الصدر، الساق، القدم) مع احترام الإليترا المرتداة.
+     * يبدل قطعة واحدة كحد أقصى في النداء لتجنب إرسال حزم كثيفة للسيرفر دفعة واحدة.
+     */
+    public static boolean equipBestArmor(LocalPlayer player, MultiPlayerGameMode gameMode) {
+        if (player == null || gameMode == null || player.isUsingItem()) return false;
+        if (player.containerMenu != player.inventoryMenu) return false;
+        if (!player.inventoryMenu.getCarried().isEmpty()) return false;
+
+        int containerId = player.inventoryMenu.containerId;
+        EquipmentSlot[] slots = {EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET};
+
+        for (EquipmentSlot slot : slots) {
+            int armorMenuSlot = getArmorMenuSlot(slot);
+            if (armorMenuSlot < 0) continue;
+
+            ItemStack worn = player.getItemBySlot(slot);
+            if (slot == EquipmentSlot.CHEST && worn.is(Items.ELYTRA)) {
+                continue;
+            }
+
+            int wornTier = getArmorTier(worn, slot);
+            int bestIdx = -1;
+            int bestTier = wornTier;
+
+            for (int i = 0; i < 36; i++) {
+                ItemStack candidate = player.getInventory().getItem(i);
+                int tier = getArmorTier(candidate, slot);
+                if (tier > bestTier) {
+                    bestTier = tier;
+                    bestIdx = i;
+                }
+            }
+
+            if (bestIdx != -1) {
+                int sourceMenuSlot = bestIdx < 9 ? 36 + bestIdx : bestIdx;
+                if (worn.isEmpty()) {
+                    gameMode.handleContainerInput(containerId, sourceMenuSlot, 0, ContainerInput.QUICK_MOVE, player);
+                } else {
+                    gameMode.handleContainerInput(containerId, sourceMenuSlot, 0, ContainerInput.PICKUP, player);
+                    gameMode.handleContainerInput(containerId, armorMenuSlot, 0, ContainerInput.PICKUP, player);
+                    gameMode.handleContainerInput(containerId, sourceMenuSlot, 0, ContainerInput.PICKUP, player);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * صيانة بقاء البوت: الأولوية القصوى لتوتم البقاء عند انخفاض الصحة، وإعادة الدرع عند التعافي، وارتداء أقوى الدروع.
+     *
+     * @return true إذا كان التوتم مطلوباً ومُفعلاً في اليد اليسرى الآن بسبب الخطر الحرج.
+     */
+    public static boolean maintainCombatSurvivalGear(
+            LocalPlayer player,
+            MultiPlayerGameMode gameMode,
+            boolean tryEquipArmor,
+            boolean restoreShieldWhenHealthy) {
+        if (player == null || gameMode == null) return false;
+
+        boolean totemCrisis = false;
+        if (isCriticalHealthForTotem(player)) {
+            ensureTotemInOffhand(player, gameMode);
+            totemCrisis = player.getOffhandItem().is(Items.TOTEM_OF_UNDYING) || hasTotemInInventory(player);
+        } else if (restoreShieldWhenHealthy && player.getOffhandItem().is(Items.TOTEM_OF_UNDYING)) {
+            if (!ensureInOffhand(player, gameMode, stack -> stack.is(Items.SHIELD) && !player.getCooldowns().isOnCooldown(stack))) {
+                ensureInOffhand(player, gameMode, stack -> stack.is(Items.SHIELD));
+            }
+        }
+
+        if (tryEquipArmor) {
+            equipBestArmor(player, gameMode);
+        }
+        return totemCrisis;
     }
 }

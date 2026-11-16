@@ -43,6 +43,7 @@ public final class BotCommandHelpers {
         suggestMatching(CROP_SUGGESTIONS, builder);
 
     public static final SuggestionProvider<FabricClientCommandSource> FARM_AREAS = (ctx, builder) -> {
+        FarmAreaManager.getInstance().updateContext(Minecraft.getInstance());
         List<String> names = new ArrayList<>();
         for (FarmArea area : FarmAreaManager.getInstance().getAllAreas()) {
             names.add(area.getName());
@@ -51,6 +52,7 @@ public final class BotCommandHelpers {
     };
 
     public static final SuggestionProvider<FabricClientCommandSource> SELECTABLE_AREAS = (ctx, builder) -> {
+        FarmAreaManager.getInstance().updateContext(Minecraft.getInstance());
         List<String> names = new ArrayList<>();
         names.add("all");
         names.add("none");
@@ -83,6 +85,7 @@ public final class BotCommandHelpers {
     private static CompletableFuture<Suggestions> suggestAreaStateTargets(
             boolean currentEnabledState,
             SuggestionsBuilder builder) {
+        FarmAreaManager.getInstance().updateContext(Minecraft.getInstance());
         List<String> names = new ArrayList<>();
         names.add("all");
         names.add("الكل");
