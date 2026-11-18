@@ -16,6 +16,8 @@ import net.minecraft.world.item.BowItem;
 import net.minecraft.world.item.CrossbowItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.item.enchantment.Enchantments;
+import net.minecraft.world.item.enchantment.ItemEnchantments;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
@@ -55,47 +57,107 @@ public final class BotEquipmentHelper {
     }
 
     /**
-     * درجة أفضلية السيوف (6 للنيذررايت وحتى 1 للخشبي، و0 لغير السيوف).
+     * درجة أفضلية السيوف (7 للنيذررايت وحتى 1 للخشبي مع دعم النحاس في 26.2، و0 لغير السيوف).
      */
     public static int getSwordTier(ItemStack stack) {
         if (stack == null || stack.isEmpty()) return 0;
-        if (stack.is(Items.NETHERITE_SWORD)) return 6;
-        if (stack.is(Items.DIAMOND_SWORD)) return 5;
-        if (stack.is(Items.IRON_SWORD)) return 4;
+        if (stack.is(Items.NETHERITE_SWORD)) return 7;
+        if (stack.is(Items.DIAMOND_SWORD)) return 6;
+        if (stack.is(Items.IRON_SWORD)) return 5;
+        if (stack.is(Items.COPPER_SWORD)) return 4;
         if (stack.is(Items.STONE_SWORD)) return 3;
         if (stack.is(Items.GOLDEN_SWORD)) return 2;
         if (stack.is(Items.WOODEN_SWORD)) return 1;
-        return 0;
+        return stack.is(ItemTags.SWORDS) ? 1 : 0;
     }
 
     /**
-     * درجة أفضلية الفؤوس (6 للنيذررايت وحتى 1 للخشبي، و0 لغير الفؤوس).
+     * درجة أفضلية الفؤوس (7 للنيذررايت وحتى 1 للخشبي مع دعم النحاس في 26.2، و0 لغير الفؤوس).
      */
     public static int getAxeTier(ItemStack stack) {
         if (stack == null || stack.isEmpty()) return 0;
-        if (stack.is(Items.NETHERITE_AXE)) return 6;
-        if (stack.is(Items.DIAMOND_AXE)) return 5;
-        if (stack.is(Items.IRON_AXE)) return 4;
+        if (stack.is(Items.NETHERITE_AXE)) return 7;
+        if (stack.is(Items.DIAMOND_AXE)) return 6;
+        if (stack.is(Items.IRON_AXE)) return 5;
+        if (stack.is(Items.COPPER_AXE)) return 4;
         if (stack.is(Items.STONE_AXE)) return 3;
         if (stack.is(Items.GOLDEN_AXE)) return 2;
         if (stack.is(Items.WOODEN_AXE)) return 1;
-        return 0;
+        return (stack.getItem() instanceof AxeItem || stack.is(ItemTags.AXES)) ? 1 : 0;
     }
 
     /**
-     * درجة أفضلية الفأس مع السيف كبديل احتياطي لوضع الدفاع المستقل.
+     * مكافأة التطويرات القتالية وتطوير الغنائم (Looting) لتحديد السلاح الأقوى فعلياً.
+     */
+    public static int getWeaponEnchantBonus(ItemStack stack, boolean prioritizeLooting) {
+        if (stack == null || stack.isEmpty()) return 0;
+        ItemEnchantments enchantments = stack.getEnchantments();
+        if (enchantments == null || enchantments.isEmpty()) return 0;
+
+        int bonus = 0;
+        for (var entry : enchantments.entrySet()) {
+            var holder = entry.getKey();
+            int level = entry.getIntValue();
+            if (level <= 0) continue;
+            if (holder.is(Enchantments.SHARPNESS)) {
+                bonus += level * 4;
+            } else if (holder.is(Enchantments.SMITE) || holder.is(Enchantments.BANE_OF_ARTHROPODS)) {
+                bonus += level * 2;
+            } else if (holder.is(Enchantments.FIRE_ASPECT)) {
+                bonus += level * 3;
+            } else if (holder.is(Enchantments.SWEEPING_EDGE)) {
+                bonus += level * 2;
+            } else if (holder.is(Enchantments.KNOCKBACK)) {
+                bonus += level;
+            } else if (holder.is(Enchantments.LOOTING)) {
+                bonus += level * (prioritizeLooting ? 12 : 3);
+            }
+        }
+        return bonus;
+    }
+
+    public static int getSwordCombatScore(ItemStack stack, boolean prioritizeLooting) {
+        int tier = getSwordTier(stack);
+        if (tier <= 0) return 0;
+        return tier * 10 + getWeaponEnchantBonus(stack, prioritizeLooting);
+    }
+
+    public static int getAxeCombatScore(ItemStack stack, boolean prioritizeLooting) {
+        int tier = getAxeTier(stack);
+        if (tier <= 0) return 0;
+        return tier * 10 + getWeaponEnchantBonus(stack, prioritizeLooting);
+    }
+
+    public static int getMeleeWeaponCombatScore(ItemStack stack, boolean prioritizeLooting) {
+        return Math.max(getSwordCombatScore(stack, prioritizeLooting), getAxeCombatScore(stack, prioritizeLooting));
+    }
+
+    public static int getBestSwordScore(LocalPlayer player, boolean prioritizeLooting) {
+        return getBestWeaponScore(player, stack -> getSwordCombatScore(stack, prioritizeLooting));
+    }
+
+    public static int getBestAxeScore(LocalPlayer player, boolean prioritizeLooting) {
+        return getBestWeaponScore(player, stack -> getAxeCombatScore(stack, prioritizeLooting));
+    }
+
+    private static int getBestWeaponScore(LocalPlayer player, ToIntFunction<ItemStack> scorer) {
+        if (player == null) return 0;
+        int best = 0;
+        for (int i = 0; i < 36; i++) {
+            int score = scorer.applyAsInt(player.getInventory().getItem(i));
+            if (score > best) {
+                best = score;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * التقييم المتوازن لأقوى سلاح قريب (سيف أو فأس) بناءً على الخامة والتطويرات بدون انحياز قسري لفأس أضعف.
      */
     public static int getAxeOrSwordTier(ItemStack stack) {
-        if (stack == null || stack.isEmpty()) return -1;
-        if (stack.getItem() instanceof AxeItem) {
-            int tier = getAxeTier(stack);
-            return tier > 0 ? tier + 1 : 2;
-        }
-        if (stack.is(ItemTags.SWORDS)) {
-            int tier = getSwordTier(stack);
-            return tier > 0 ? tier : 1;
-        }
-        return -1;
+        int score = getMeleeWeaponCombatScore(stack, false);
+        return score > 0 ? score : -1;
     }
 
     /**
@@ -317,9 +379,9 @@ public final class BotEquipmentHelper {
     /**
      * حساب المسافة الفعلية من موضع عيني البوت إلى أقرب نقطة على صندوق تصادم الهدف (AABB).
      */
-    public static double getEyeToHitboxDistanceSq(LocalPlayer player, Entity target) {
-        if (player == null || target == null) return Double.MAX_VALUE;
-        Vec3 eye = player.getEyePosition();
+    public static double getEyeToHitboxDistanceSq(Entity viewer, Entity target) {
+        if (viewer == null || target == null) return Double.MAX_VALUE;
+        Vec3 eye = viewer.getEyePosition();
         AABB box = target.getBoundingBox();
         double cx = Math.max(box.minX, Math.min(eye.x, box.maxX));
         double cy = Math.max(box.minY, Math.min(eye.y, box.maxY));
@@ -327,8 +389,8 @@ public final class BotEquipmentHelper {
         return eye.distanceToSqr(cx, cy, cz);
     }
 
-    public static double getEyeToHitboxDistance(LocalPlayer player, Entity target) {
-        double sq = getEyeToHitboxDistanceSq(player, target);
+    public static double getEyeToHitboxDistance(Entity viewer, Entity target) {
+        double sq = getEyeToHitboxDistanceSq(viewer, target);
         return sq == Double.MAX_VALUE ? Double.MAX_VALUE : Math.sqrt(sq);
     }
 
@@ -602,5 +664,61 @@ public final class BotEquipmentHelper {
             equipBestArmor(player, gameMode);
         }
         return totemCrisis;
+    }
+
+    public static boolean ensureBestSwordInMainHand(
+            LocalPlayer player,
+            MultiPlayerGameMode gameMode,
+            boolean prioritizeLooting,
+            int fallbackHotbarSlot) {
+        return ensureBestInMainHand(player, gameMode, stack -> getSwordCombatScore(stack, prioritizeLooting), 1, fallbackHotbarSlot);
+    }
+
+    public static boolean ensureBestAxeInMainHand(
+            LocalPlayer player,
+            MultiPlayerGameMode gameMode,
+            boolean prioritizeLooting,
+            int fallbackHotbarSlot) {
+        return ensureBestInMainHand(player, gameMode, stack -> getAxeCombatScore(stack, prioritizeLooting), 1, fallbackHotbarSlot);
+    }
+
+    public static boolean hasKeepableGearOrTool(LocalPlayer player, ItemStack stack) {
+        if (stack == null || stack.isEmpty()) return false;
+        if (stack.is(Items.TOTEM_OF_UNDYING) || stack.is(Items.SHIELD) || stack.is(Items.ELYTRA) || stack.is(Items.LEAD)) {
+            return true;
+        }
+        if (stack.is(ItemTags.PICKAXES) || stack.is(ItemTags.SHOVELS) || stack.is(ItemTags.HOES)
+                || stack.is(ItemTags.SPEARS) || stack.is(Items.MACE) || stack.is(Items.TRIDENT)) {
+            return true;
+        }
+        if (getSwordTier(stack) >= 6 || getAxeTier(stack) >= 6 || stack.isEnchanted()) {
+            return true;
+        }
+        if (getSwordTier(stack) > 0) {
+            return getSwordCombatScore(stack, true) >= getBestSwordScore(player, true);
+        }
+        if (getAxeTier(stack) > 0) {
+            return getAxeCombatScore(stack, false) >= getBestAxeScore(player, false);
+        }
+        if (isRangedWeapon(stack)) {
+            int myScore = getRangedWeaponTier(stack, true);
+            int bestRanged = 0;
+            if (player != null) {
+                for (int i = 0; i < 36; i++) {
+                    ItemStack invStack = player.getInventory().getItem(i);
+                    if (isRangedWeapon(invStack)) {
+                        bestRanged = Math.max(bestRanged, getRangedWeaponTier(invStack, true));
+                    }
+                }
+            }
+            return myScore >= bestRanged && myScore > 0;
+        }
+        for (EquipmentSlot slot : new EquipmentSlot[]{EquipmentSlot.HEAD, EquipmentSlot.CHEST, EquipmentSlot.LEGS, EquipmentSlot.FEET}) {
+            int tier = getArmorTier(stack, slot);
+            if (tier >= 55) { // احتفاظ بدرع دايموند/نيذررايت أو مطوّر
+                return true;
+            }
+        }
+        return false;
     }
 }

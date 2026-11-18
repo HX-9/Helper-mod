@@ -77,6 +77,12 @@ public class BotNavigator {
     private final List<BlockPos> airEscapePath = new ArrayList<>();
     private int airEscapeRecalcCooldown = 0;
 
+    // توجيه المراحل المتدرجة للأهداف البعيدة (> 36 بلوكة مثل 200+ بلوكة) لتجنب استهلاك عقد A* أو تخطي الشانكات
+    private Vec3 longRangeWaypoint = null;
+    private Vec3 longRangeDestAnchor = null;
+    private int longRangeWaypointTicks = 0;
+    private int longRangeFlankIndex = 0;
+
     public List<BlockPos> getCurrentPath() {
         return Collections.unmodifiableList(currentPath);
     }
@@ -123,6 +129,7 @@ public class BotNavigator {
         recoveringAir = false;
         airEscapePath.clear();
         airEscapeRecalcCooldown = 0;
+        clearLongRangeWaypoint();
         BotEquipmentHelper.releaseMovementKeys(client);
     }
 
@@ -131,7 +138,15 @@ public class BotNavigator {
         lastGoalPos = null;
         pathRecalcCooldown = 0;
         lastStepBlockedUnreachable = false;
+        clearLongRangeWaypoint();
         resetDoorState(null);
+    }
+
+    private void clearLongRangeWaypoint() {
+        longRangeWaypoint = null;
+        longRangeDestAnchor = null;
+        longRangeWaypointTicks = 0;
+        longRangeFlankIndex = 0;
     }
 
     public NavResult navigateTo(
@@ -220,16 +235,43 @@ public class BotNavigator {
             }
             currentPath.clear();
             lastGoalPos = null;
+            clearLongRangeWaypoint();
             stuckStages = 0;
             stuckWindowTicks = 0;
             stuckWindowAnchorPos = null;
             return NavResult.ARRIVED;
         }
 
-        BlockPos goalPos = BlockPos.containing(destination.x, destination.y, destination.z);
+        // تقسيم المسافات البعيدة (> 36 بلوكة مثل 200+ بلوكة) إلى مراحل وسطية قابلة للملاحة بسلاسة
+        boolean longRangeMode = horizDistSq > 36.0 * 36.0;
+        Vec3 effectiveDestination = destination;
+        int effectiveMaxNodes = maxNodes;
+        if (longRangeMode) {
+            effectiveMaxNodes = Math.max(maxNodes, 6000);
+            boolean needNewSubGoal = longRangeWaypoint == null
+                || longRangeDestAnchor == null
+                || longRangeDestAnchor.distanceToSqr(destination) > 16.0 * 16.0
+                || player.position().distanceToSqr(longRangeWaypoint) <= 6.5 * 6.5
+                || longRangeWaypointTicks > 180;
+            if (needNewSubGoal) {
+                longRangeDestAnchor = destination;
+                longRangeWaypoint = pickLongRangeIntermediateWaypoint(level, player, destination, longRangeFlankIndex);
+                longRangeWaypointTicks = 0;
+                currentPath.clear();
+                lastGoalPos = null;
+            }
+            longRangeWaypointTicks++;
+            if (longRangeWaypoint != null) {
+                effectiveDestination = longRangeWaypoint;
+            }
+        } else if (longRangeWaypoint != null) {
+            clearLongRangeWaypoint();
+        }
+
+        BlockPos goalPos = BlockPos.containing(effectiveDestination.x, effectiveDestination.y, effectiveDestination.z);
 
         // 2. كاشف التعثر بنافذة زمنية (كل 10 تكات)
-        updateStuckDetector(client, player, level, gameMode, destination, protectFarmSoil, closeDoorsAfterCrossing);
+        updateStuckDetector(client, player, level, gameMode, effectiveDestination, protectFarmSoil, closeDoorsAfterCrossing);
 
         // 3. التحقق من صلاحية المسار الحالي وإعادة الحساب عند الحاجة
         boolean pathInvalid = isCurrentPathBlocked(level);
@@ -240,12 +282,12 @@ public class BotNavigator {
 
         if (needNewPath && pathRecalcCooldown <= 0) {
             lastGoalPos = goalPos;
-            pathRecalcCooldown = 8;
+            pathRecalcCooldown = longRangeMode ? 12 : 8;
             FarmPathfinder.PathResult res = FarmPathfinder.findPathDetailed(
                 level,
                 player.blockPosition(),
                 goalPos,
-                maxNodes,
+                effectiveMaxNodes,
                 resolvedOptions
             );
             currentPath.clear();
@@ -263,6 +305,12 @@ public class BotNavigator {
                     }
                 }
             } else {
+                if (longRangeMode) {
+                    longRangeFlankIndex = (longRangeFlankIndex + 1) % 9;
+                    longRangeWaypoint = pickLongRangeIntermediateWaypoint(level, player, destination, longRangeFlankIndex);
+                    longRangeWaypointTicks = 0;
+                    lastGoalPos = null;
+                }
                 pathRecalcCooldown = 12;
             }
         }
@@ -297,8 +345,13 @@ public class BotNavigator {
                 if (!currentPath.isEmpty()) {
                     nextNode = currentPath.get(0);
                     nextTarget = new Vec3(nextNode.getX() + 0.5, nextNode.getY(), nextNode.getZ() + 0.5);
-                } else if (isDirectGroundStepSafe(level, player.position(), destination, Math.max(stopDist + 3.0, 5.0))) {
-                    nextTarget = destination;
+                } else if (longRangeMode) {
+                    longRangeWaypoint = pickLongRangeIntermediateWaypoint(level, player, destination, longRangeFlankIndex);
+                    longRangeWaypointTicks = 0;
+                    lastGoalPos = null;
+                    return NavResult.MOVING;
+                } else if (isDirectGroundStepSafe(level, player.position(), effectiveDestination, Math.max(stopDist + 3.0, 5.0))) {
+                    nextTarget = effectiveDestination;
                 } else {
                     BotEquipmentHelper.releaseMovementKeys(client);
                     maintainWaterBuoyancy(client, player, level, null);
@@ -310,8 +363,16 @@ public class BotNavigator {
             }
         } else {
             // إذا لم يجد A* أي مسار، لا نتجه بخط مستقيم إلا إذا كان الخط المباشر قصيراً وآمناً بالكامل
-            if (isDirectGroundStepSafe(level, player.position(), destination, 6.0)) {
-                nextTarget = destination;
+            if (isDirectGroundStepSafe(level, player.position(), effectiveDestination, 6.0)) {
+                nextTarget = effectiveDestination;
+            } else if (longRangeMode) {
+                longRangeFlankIndex = (longRangeFlankIndex + 1) % 9;
+                longRangeWaypoint = pickLongRangeIntermediateWaypoint(level, player, destination, longRangeFlankIndex);
+                longRangeWaypointTicks = 0;
+                lastGoalPos = null;
+                BotEquipmentHelper.releaseMovementKeys(client);
+                maintainWaterBuoyancy(client, player, level, null);
+                return NavResult.MOVING;
             } else {
                 BotEquipmentHelper.releaseMovementKeys(client);
                 maintainWaterBuoyancy(client, player, level, null);
@@ -326,6 +387,63 @@ public class BotNavigator {
         // 6. تنفيذ الحركة الآمنة مع فحص المخاطر والسقوط والسباحة والغوص وحماية التربة الزراعية
         executeMove(client, player, level, nextTarget.x, nextTarget.y, nextTarget.z, allowSprint, isEating, maxTurnSpeed, rotateLook, protectFarmSoil);
         return NavResult.MOVING;
+    }
+
+    private Vec3 pickLongRangeIntermediateWaypoint(ClientLevel level, LocalPlayer player, Vec3 destination, int startFlankIndex) {
+        double dx = destination.x - player.getX();
+        double dz = destination.z - player.getZ();
+        double horizDist = Math.sqrt(dx * dx + dz * dz);
+        if (horizDist <= 1.0) {
+            return destination;
+        }
+        double baseAngle = Math.atan2(dz, dx);
+        double[] angleOffsetsDeg = {0.0, 25.0, -25.0, 50.0, -50.0, 80.0, -80.0, 110.0, -110.0};
+        double[] stepRadii = {
+            Math.max(18.0, Math.min(32.0, horizDist * 0.55)),
+            16.0
+        };
+        int refY = player.blockPosition().getY();
+
+        for (double stepRadius : stepRadii) {
+            for (int k = 0; k < angleOffsetsDeg.length; k++) {
+                double rad = baseAngle + Math.toRadians(angleOffsetsDeg[(startFlankIndex + k) % angleOffsetsDeg.length]);
+                int wx = (int) Math.round(player.getX() + Math.cos(rad) * stepRadius);
+                int wz = (int) Math.round(player.getZ() + Math.sin(rad) * stepRadius);
+                BlockPos surface = findWalkableSurfaceColumn(level, wx, refY, wz);
+                if (surface != null) {
+                    return new Vec3(surface.getX() + 0.5, surface.getY(), surface.getZ() + 0.5);
+                }
+            }
+        }
+        double clampStep = Math.min(24.0, horizDist * 0.5);
+        return new Vec3(player.getX() + (dx / horizDist) * clampStep, player.getY(), player.getZ() + (dz / horizDist) * clampStep);
+    }
+
+    private BlockPos findWalkableSurfaceColumn(ClientLevel level, int x, int refY, int z) {
+        for (int dy = 14; dy >= -14; dy--) {
+            BlockPos feet = new BlockPos(x, refY + dy, z);
+            BlockState below = level.getBlockState(feet.below());
+            if (!FarmPathfinder.isHazard(below)
+                    && !FarmPathfinder.isHazard(level.getBlockState(feet))
+                    && !below.isAir()
+                    && !FarmPathfinder.isFenceOrWall(below)
+                    && !FarmPathfinder.isChestOrContainer(below)
+                    && !below.getCollisionShape(level, feet.below()).isEmpty()
+                    && FarmPathfinder.isFeetPassable(level, feet)
+                    && FarmPathfinder.isPassable(level, feet.above())) {
+                return feet;
+            }
+        }
+        for (int dy = 8; dy >= -8; dy--) {
+            BlockPos feet = new BlockPos(x, refY + dy, z);
+            if (FarmPathfinder.isWater(level, feet.below())
+                    && !FarmPathfinder.isWaterColumnHazardous(level, feet)
+                    && FarmPathfinder.isPassable(level, feet)
+                    && FarmPathfinder.isPassable(level, feet.above())) {
+                return feet;
+            }
+        }
+        return null;
     }
 
     private void updateStuckDetector(

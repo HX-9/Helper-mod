@@ -4,6 +4,7 @@ import com.helpermod.bot.BotFollowController;
 import com.helpermod.bot.BotGlobalManager;
 import com.helpermod.bot.FarmBotController;
 import com.helpermod.bot.FightBotController;
+import com.helpermod.bot.hunt.MobHuntController;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
@@ -31,6 +32,7 @@ public class BotCommand {
             .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("stop")
                 .executes(BotCommand::executeStopAll))
             .then(FarmCommand.build())
+            .then(HuntCommand.build())
             .then(DefendCommand.build())
             .then(FriendCommand.build())
             .then(FollowCommand.build())
@@ -51,6 +53,7 @@ public class BotCommand {
         FightBotController.DefenseMode defMode = FightBotController.getInstance().getDefenseMode();
         boolean isFollowing = BotFollowController.getInstance().isFollowing();
         boolean isFarming = FarmBotController.getInstance().isFarming();
+        boolean isHunting = MobHuntController.getInstance().isHunting();
 
         FabricClientCommandSource source = context.getSource();
         BotCommandHelpers.send(source, "§6==== [حالة نظام البوت والمود] ====");
@@ -58,6 +61,10 @@ public class BotCommand {
         BotCommandHelpers.send(source, "§7- وضع الدفاع (Defend): §e" + defMode.getDisplayName());
         BotCommandHelpers.send(source, "§7- وضع الاتباع (Follow): " + (isFollowing ? "§aمفعّل (يتبع: " + BotFollowController.getInstance().getTargetPlayerName() + ")" : "§7غير مفعّل"));
         BotCommandHelpers.send(source, "§7- وضع المزرعة (Farm): " + (isFarming ? "§aيعمل حالياً" : "§7متوقف"));
+        BotCommandHelpers.send(source, "§7- وضع صيد وتجميع الموبات (Hunt): " + (isHunting ? "§aيعمل حالياً (" + MobHuntController.getInstance().getActiveMode().getArabicName() + ")" : "§7متوقف"));
+        if (BotGlobalManager.getInstance().isUserControlPaused()) {
+            BotCommandHelpers.send(source, "§7- التوقف المؤقت لتحكم المستخدم: §eنشط (يتبقى " + BotGlobalManager.getInstance().getUserControlPauseRemainingSeconds() + " ث)");
+        }
         BotCommandHelpers.send(source, "§eللتحكم العام: §f/bot mode on §7أو §f/bot mode off §7أو §f/bot stop");
         return 1;
     }
@@ -73,7 +80,8 @@ public class BotCommand {
         BotCommandHelpers.send(source, "§6=== [أوامر المساعد الآلي - HelperMod] ===");
         BotCommandHelpers.send(source, "§6/bot mode [on|off|status] §7- تشغيل أو إيقاف المود بالكامل في المطلق (Bot Mode)");
         BotCommandHelpers.send(source, "§6/bot stop §7- إيقاف الزراعة والاتباع والدفاع فوراً وتحرير الحركة");
-        BotCommandHelpers.send(source, "§b/bot follow [<name>|stop|status] §7- اتباع لاعب بمسار آمن أو عرض حالة الاتباع");
+        BotCommandHelpers.send(source, "§b/bot follow [<name>|stop|status|ban] §7- اتباع لاعب بمسار آمن أو حظر موبات معينة إلا عند هجوم القائد");
+        BotCommandHelpers.send(source, "§e/bot hunt [start|stop|status|target|rule|loot|area] §7- صيد وتجميع الموبات والحيوانات");
         BotCommandHelpers.send(source, "§a/bot defend [cautious|combat|on|off|status] §7- أنماط الحماية والدفاع (حذر / قتال / إيقاف)");
         BotCommandHelpers.send(source, "§a/bot friend [add|remove|list] <name> §7- إدارة قائمة الأصدقاء المستثنين من الحذر والدفاع");
         BotCommandHelpers.send(source, "§d/bot food [add|remove|clear|list] <name> §7- إدارة قائمة الأطعمة المسموحة للبوت");

@@ -11,13 +11,10 @@ import com.mojang.brigadier.builder.RequiredArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.block.BedBlock;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.phys.BlockHitResult;
-import net.minecraft.world.phys.HitResult;
 
 import java.util.Collection;
 import java.util.List;
@@ -432,10 +429,10 @@ public final class FarmCommand {
             String stateBadge = area.isEnabled() ? "§a[مفعل]" : "§c[غير مفعل]";
             StringBuilder chestInfo = new StringBuilder();
             if (!area.getCropChests().isEmpty()) {
-                chestInfo.append(" §6[محصول: ").append(formatCompactChests(area.getCropChests())).append("]");
+                chestInfo.append(" §6[محصول: ").append(BotCommandHelpers.formatCompactChests(area.getCropChests())).append("]");
             }
             if (!area.getSeedChests().isEmpty()) {
-                chestInfo.append(" §e[بذور: ").append(formatCompactChests(area.getSeedChests())).append("]");
+                chestInfo.append(" §e[بذور: ").append(BotCommandHelpers.formatCompactChests(area.getSeedChests())).append("]");
             }
             BotCommandHelpers.send(context.getSource(), stateBadge + " §b" + area.getName() + " §7[" + coords + "] - المحصول: §e" + area.getCropDisplayName() + chestInfo);
         }
@@ -639,16 +636,6 @@ public final class FarmCommand {
         return 1;
     }
 
-    private static String formatCompactChests(List<BlockPos> chests) {
-        if (chests == null || chests.isEmpty()) return "غير محدد";
-        if (chests.size() == 1) {
-            BlockPos p = chests.get(0);
-            return p.getX() + "," + p.getY() + "," + p.getZ();
-        }
-        BlockPos first = chests.get(0);
-        return chests.size() + " صناديق (الأول: " + first.getX() + "," + first.getY() + "," + first.getZ() + ")";
-    }
-
     private static void sendFarmChestSummary(
             FabricClientCommandSource source,
             FarmArea area,
@@ -741,7 +728,7 @@ public final class FarmCommand {
             ? FarmArea.ChestRole.SEED
             : FarmArea.ChestRole.CROP;
 
-        BlockPos targetChest = resolveContainerFromLookOrNearby(client, check ->
+        BlockPos targetChest = BotCommandHelpers.resolveContainerFromLookOrNearby(client, check ->
             FarmAreaManager.isSameStorageContainer(client.level, check, fertChest)
                 || FarmAreaManager.containsStorageContainer(client.level, area.getChests(otherRole), check)
                 || (append && FarmAreaManager.containsStorageContainer(client.level, area.getChests(role), check)));
@@ -964,7 +951,7 @@ public final class FarmCommand {
         }
 
         FarmAreaManager manager = getScopedManager();
-        BlockPos targetChest = resolveContainerFromLookOrNearby(
+        BlockPos targetChest = BotCommandHelpers.resolveContainerFromLookOrNearby(
             client,
             check -> manager.findAreaUsingChest(client.level, check) != null
         );
@@ -986,7 +973,7 @@ public final class FarmCommand {
         }
 
         FarmAreaManager manager = getScopedManager();
-        BlockPos targetChest = resolveContainerFromLookOrNearby(
+        BlockPos targetChest = BotCommandHelpers.resolveContainerFromLookOrNearby(
             client,
             check -> manager.findAreaUsingChest(client.level, check) != null
         );
@@ -1006,50 +993,5 @@ public final class FarmCommand {
         manager.setAwaitingFertilizerChest(false);
         BotCommandHelpers.send(context.getSource(), "§a[Bot] تم إلغاء تحديد صندوق السماد بنجاح.");
         return 1;
-    }
-
-    private static BlockPos resolveContainerFromLookOrNearby(
-            Minecraft client,
-            java.util.function.Predicate<BlockPos> shouldPreferSkip) {
-        if (client.level == null || client.player == null) {
-            return null;
-        }
-        ClientLevel level = client.level;
-
-        // الأولوية القصوى لما ينظر إليه اللاعب مباشرة تحت مؤشر التصويب (Crosshair)
-        if (client.hitResult instanceof BlockHitResult bhr && bhr.getType() == HitResult.Type.BLOCK) {
-            BlockPos lookPos = bhr.getBlockPos();
-            if (FarmAreaManager.isStorageContainerBlock(level.getBlockState(lookPos))) {
-                return lookPos.immutable();
-            }
-        }
-
-        // البحث عن أقرب حاوية في المحيط القريب (3 بلوكات) مع تفضيل الصناديق غير المتعارضة
-        BlockPos center = client.player.blockPosition();
-        BlockPos bestPreferred = null;
-        double bestPreferredDistSq = Double.MAX_VALUE;
-        BlockPos bestAny = null;
-        double bestAnyDistSq = Double.MAX_VALUE;
-
-        for (int dy = -1; dy <= 2; dy++) {
-            for (int dx = -3; dx <= 3; dx++) {
-                for (int dz = -3; dz <= 3; dz++) {
-                    BlockPos check = center.offset(dx, dy, dz);
-                    if (!FarmAreaManager.isStorageContainerBlock(level.getBlockState(check))) {
-                        continue;
-                    }
-                    double distSq = client.player.distanceToSqr(check.getX() + 0.5, check.getY() + 0.5, check.getZ() + 0.5);
-                    if (distSq < bestAnyDistSq) {
-                        bestAnyDistSq = distSq;
-                        bestAny = check.immutable();
-                    }
-                    if ((shouldPreferSkip == null || !shouldPreferSkip.test(check)) && distSq < bestPreferredDistSq) {
-                        bestPreferredDistSq = distSq;
-                        bestPreferred = check.immutable();
-                    }
-                }
-            }
-        }
-        return bestPreferred != null ? bestPreferred : bestAny;
     }
 }

@@ -11,6 +11,7 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.NeutralMob;
 import net.minecraft.world.entity.monster.Creeper;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.player.Player;
@@ -28,6 +29,7 @@ import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import com.helpermod.bot.combat.BotCombatManager;
 import com.helpermod.bot.combat.RangedCombatHelper;
+import com.helpermod.bot.hunt.MobHuntController;
 import com.helpermod.bot.path.BotNavigator;
 import com.helpermod.bot.path.FarmPathfinder;
 import com.helpermod.bot.friend.BotFriendManager;
@@ -154,16 +156,49 @@ public class FightBotController {
             disableDefenseCompletely(client);
             sendChatMessage(client, "§c[Bot] تم إيقاف وضع الدفاع بالكامل في المطلق (/bot defend off).");
         } else if (mode == DefenseMode.CAUTIOUS) {
+            BotGlobalManager.getInstance().recordUserCommandInput(client);
             sendChatMessage(client, "§e[Bot] تم تفعيل وضع الدفاع: §6نمط الحذر (Cautious)§e! يراقب المحيط ويصد بالدرع ويتراجع عند الخطر.");
-            if (client.player != null && client.gameMode != null && !FarmBotController.getInstance().isFarming()) {
+            if (client.player != null && client.gameMode != null && !FarmBotController.getInstance().isFarming()
+                    && !BotGlobalManager.getInstance().isUserControlPaused()) {
                 ensureShieldInOffhand(client, client.player, client.gameMode);
             }
         } else if (mode == DefenseMode.COMBAT) {
-            sendChatMessage(client, "§c[Bot] تم تفعيل وضع الدفاع: §4نمط القتال (Combat)§c! يحمي نفسه ويهاجم ويقتل الوحوش المحيطة (ويهرب من الكريبر).");
-            if (client.player != null && client.gameMode != null && !FarmBotController.getInstance().isFarming()) {
+            BotGlobalManager.getInstance().recordUserCommandInput(client);
+            sendChatMessage(client, "§c[Bot] تم تفعيل وضع الدفاع: §4نمط القتال (Combat)§c! يحمي نفسه ويهاجم ويقتل الوحوش المعادية المحيطة (ويهرب من Creeper).");
+            if (client.player != null && client.gameMode != null && !FarmBotController.getInstance().isFarming()
+                    && !BotGlobalManager.getInstance().isUserControlPaused()) {
                 ensureShieldInOffhand(client, client.player, client.gameMode);
             }
         }
+    }
+
+    /**
+     * تعليق حالة القتال والدفاع مؤقتاً عند تدخل المستخدم دون تغيير defenseMode المحفوظ.
+     */
+    public void pauseForUserControl(Minecraft client) {
+        isDefending = false;
+        isRetreating = false;
+        isEmergencyRunning = false;
+        inFarmCombat = false;
+        emergencyRunStartPos = null;
+        emergencyRunDir = null;
+        emergencyRunTicks = 0;
+        threatLockTicks = 0;
+        lastThreatEntityId = -1;
+        lastThreatWasHostileAggression = false;
+        currentThreatPos = null;
+        creeperCombatState = CreeperTacticState.NONE;
+        creeperCombatStartPos = null;
+        creeperCombatEscapeDir = null;
+        creeperCombatFleeTicks = 0;
+        creeperCombatAssessTicks = 0;
+        isJumpingForCrit = false;
+        critAirTicks = 0;
+        isEatingDefense = false;
+        eatingDefenseTicks = 0;
+        lastFoodLevelDefense = -1;
+        fightNavigator.reset(client);
+        rangedHelper.reset(client);
     }
 
     /**
@@ -427,6 +462,11 @@ public class FightBotController {
 
         // إذا كان البوت في وضع الاتباع، يتولى BotFollowController بالكامل إدارة القتال والمرافقة
         if (BotFollowController.getInstance().isFollowing()) {
+            return;
+        }
+
+        // إذا كان البوت في وضع صيد وتجميع الموبات، يتولى MobHuntController إدارة الحركة والقتال
+        if (MobHuntController.getInstance().isHunting()) {
             return;
         }
 
@@ -1078,7 +1118,7 @@ public class FightBotController {
     }
 
     public boolean ensureBestSwordInMainHand(LocalPlayer player, MultiPlayerGameMode gameMode) {
-        return BotEquipmentHelper.ensureBestInMainHand(player, gameMode, BotEquipmentHelper::getSwordTier, 1, 0);
+        return BotEquipmentHelper.ensureBestSwordInMainHand(player, gameMode, false, 0);
     }
 
     /**
@@ -1275,6 +1315,9 @@ public class FightBotController {
     }
 
     private boolean isHostileOrAggressive(Mob mob, LocalPlayer player) {
+        if (mob instanceof NeutralMob) {
+            return BotCombatManager.isNeutralMobActivelyHostile(mob, player, null);
+        }
         if (mob instanceof Monster) return true;
         if (mob.getTarget() == player) return true;
         if (mob.isAggressive()) return true;

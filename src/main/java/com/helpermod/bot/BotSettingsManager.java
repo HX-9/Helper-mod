@@ -2,16 +2,23 @@ package com.helpermod.bot;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.helpermod.HelperMod;
+import com.helpermod.bot.hunt.MobTypeRegistry;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.world.entity.Entity;
 
 import java.io.Reader;
 import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.Collections;
+import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * مدير حفظ الإعدادات العامة للمود (حالة التفعيل العام ونمط الدفاع) في config/helpermod_settings.json.
@@ -23,6 +30,7 @@ public class BotSettingsManager {
 
     private boolean botEnabled = true;
     private FightBotController.DefenseMode defenseMode = FightBotController.DefenseMode.CAUTIOUS;
+    private final Set<String> followBannedMobs = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
 
     private BotSettingsManager() {
         load();
@@ -57,6 +65,41 @@ public class BotSettingsManager {
         }
     }
 
+    public synchronized Set<String> getFollowBannedMobs() {
+        return Collections.unmodifiableSet(new TreeSet<>(followBannedMobs));
+    }
+
+    public synchronized boolean addFollowBannedMob(String canonicalId) {
+        if (canonicalId == null || canonicalId.isBlank()) return false;
+        boolean added = followBannedMobs.add(canonicalId.trim());
+        if (added) {
+            save();
+        }
+        return added;
+    }
+
+    public synchronized boolean removeFollowBannedMob(String canonicalId) {
+        if (canonicalId == null || canonicalId.isBlank()) return false;
+        boolean removed = followBannedMobs.remove(canonicalId.trim());
+        if (removed) {
+            save();
+        }
+        return removed;
+    }
+
+    public synchronized void clearFollowBannedMobs() {
+        if (!followBannedMobs.isEmpty()) {
+            followBannedMobs.clear();
+            save();
+        }
+    }
+
+    public synchronized boolean isFollowMobBanned(Entity entity) {
+        if (entity == null || followBannedMobs.isEmpty()) return false;
+        String canonical = MobTypeRegistry.getCanonicalMobId(entity);
+        return canonical != null && followBannedMobs.contains(canonical);
+    }
+
     private Path getConfigFile() {
         return FabricLoader.getInstance().getConfigDir().resolve("helpermod_settings.json");
     }
@@ -67,6 +110,13 @@ public class BotSettingsManager {
             JsonObject root = new JsonObject();
             root.addProperty("botEnabled", botEnabled);
             root.addProperty("defenseMode", defenseMode.name());
+            if (!followBannedMobs.isEmpty()) {
+                JsonArray bannedArr = new JsonArray();
+                for (String mobId : followBannedMobs) {
+                    bannedArr.add(mobId);
+                }
+                root.add("followBannedMobs", bannedArr);
+            }
 
             Files.createDirectories(file.getParent());
             Path tempFile = file.resolveSibling(file.getFileName().toString() + ".tmp");
@@ -101,6 +151,17 @@ public class BotSettingsManager {
                         this.defenseMode = FightBotController.DefenseMode.valueOf(rawMode);
                     } catch (IllegalArgumentException ignored) {
                         this.defenseMode = FightBotController.DefenseMode.CAUTIOUS;
+                    }
+                }
+                followBannedMobs.clear();
+                if (root.has("followBannedMobs") && root.get("followBannedMobs").isJsonArray()) {
+                    for (JsonElement el : root.getAsJsonArray("followBannedMobs")) {
+                        if (el.isJsonPrimitive()) {
+                            String normalized = MobTypeRegistry.normalizeSingleMobId(el.getAsString());
+                            if (normalized != null) {
+                                followBannedMobs.add(normalized);
+                            }
+                        }
                     }
                 }
             }

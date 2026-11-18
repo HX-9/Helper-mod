@@ -1,6 +1,7 @@
 package com.helpermod.bot;
 
 import com.helpermod.bot.food.BotFoodManager;
+import com.helpermod.bot.hunt.MobHuntController;
 import com.helpermod.bot.path.BotNavigator;
 import com.helpermod.bot.path.FarmPathfinder;
 import net.minecraft.client.Minecraft;
@@ -235,9 +236,12 @@ public class FarmBotController {
         }
         running = true;
         lastContextSignature = contextSig;
-        // إيقاف وضع الاتباع تلقائياً لمنع أي تعارض حركي
+        // إيقاف وضع الاتباع وصيد الموبات تلقائياً لمنع أي تعارض حركي
         if (BotFollowController.getInstance().isFollowing()) {
             BotFollowController.getInstance().stopFollowing(client);
+        }
+        if (MobHuntController.getInstance().isHunting()) {
+            MobHuntController.getInstance().stop(client);
         }
         resetChestWorkflowState(true);
         isDriving = false;
@@ -272,6 +276,7 @@ public class FarmBotController {
         if (client.player != null && client.gameMode != null && !BotEquipmentHelper.isCriticalHealthForTotem(client.player)) {
             FightBotController.getInstance().ensureHoeInOffhand(client, client.player, client.gameMode);
         }
+        BotGlobalManager.getInstance().clearUserControlPause();
 
         // فحص هل الوقت ليل عند بدء/العودة لوضع الزراعة للتفكير بالنوم فوراً (في الأبعاد التي تدعم الأسرة فقط)
         if (client.level != null && FarmAreaManager.isBedDimensionSupported(client.level)) {
@@ -288,6 +293,31 @@ public class FarmBotController {
         if (!BotGlobalManager.getInstance().isBotEnabled()) {
             sendChatMessage(client, "§e[Bot] تنبيه: الوضع العام للمود متوقف حالياً (/bot mode off). فعّله عبر: §b/bot mode on");
         }
+    }
+
+    /**
+     * تعليق نشاط الزراعة مؤقتاً عند تدخل المستخدم مع الحفاظ على مرحلة المزرعة الحالية.
+     */
+    public void pauseForUserControl(Minecraft client) {
+        if (!running) return;
+        isDriving = false;
+        cooldownTicks = 0;
+        isEating = false;
+        eatingTicks = 0;
+        lastFoodLevel = -1;
+        doingFinalVerification = false;
+        finalVerificationTicks = 0;
+        isEvadingThreat = false;
+        isRetreatingInFarm = false;
+        isEmergencyRunningFarm = false;
+        emergencyRunStartPosFarm = null;
+        emergencyRunDirFarm = null;
+        emergencyRunTicksFarm = 0;
+        evadeTicks = 0;
+        noThreatTicks = 0;
+        trackedGoalPos = null;
+        farmNavigator.reset(client);
+        FightBotController.getInstance().pauseForUserControl(client);
     }
 
     public void stop(Minecraft client) {

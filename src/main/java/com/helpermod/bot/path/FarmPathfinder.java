@@ -95,7 +95,10 @@ public class FarmPathfinder {
         // مراقبة الليل أو العواصف الرعدية لتفضيل الطرق المضاءة بالمشاعل والفوانيس
         boolean isNightTime = level.isThundering() || (level.getSkyDarken() >= 4);
 
-        PathNode startNode = new PathNode(start, null, 0, distance(start, goal));
+        double startDist = distance(start, goal);
+        double heuristicWeight = startDist > 22.0 ? 1.55 : 1.0;
+
+        PathNode startNode = new PathNode(start, null, 0, startDist, heuristicWeight);
         openSet.add(startNode);
         allNodes.put(start, startNode);
 
@@ -141,7 +144,7 @@ public class FarmPathfinder {
 
                     if (isValidStep(level, current.pos, candidate, dy, opts.checkStepHeadroom(), opts.allowUnderwater())) {
                         double stepCost = computeStepCost(level, candidate, dy != 0 ? 1.5 : 1.0, isNightTime, opts.avoidCactusAdjacent());
-                        relaxNeighbor(current, candidate, stepCost, goal, allNodes, openSet);
+                        relaxNeighbor(current, candidate, stepCost, goal, heuristicWeight, allNodes, openSet);
                     }
                 }
             }
@@ -162,22 +165,22 @@ public class FarmPathfinder {
                         && isSafeDiagonalCorner(level, current.pos, cornerB, opts.allowUnderwater())
                         && isValidStep(level, current.pos, candidate, 0, opts.checkStepHeadroom(), opts.allowUnderwater())) {
                         double stepCost = computeStepCost(level, candidate, 1.414, isNightTime, opts.avoidCactusAdjacent());
-                        relaxNeighbor(current, candidate, stepCost, goal, allNodes, openSet);
+                        relaxNeighbor(current, candidate, stepCost, goal, heuristicWeight, allNodes, openSet);
                     }
                 }
             }
         }
 
-        // إذا لم نصل للهدف بسبب نفاد ميزانية العقد مع بقاء مسارات حية مفتوحة، نختار أفضل نقطة في الواجهة المفتوحة
+        // إذا لم نصل للهدف بسبب نفاد ميزانية العقد مع بقاء مسارات حية مفتوحة، نختار أفضل نقطة تتقدم نحو الهدف
         if (!openSet.isEmpty()) {
             PathNode bestFrontier = pickBestFrontierNode(openSet, closedSet);
-            if (bestFrontier != null && bestFrontier != startNode && bestFrontier.hCost < startNode.hCost + 6.0) {
+            double allowedBacktrack = Math.max(10.0, startDist * 0.25);
+            if (bestFrontier != null && bestFrontier != startNode && bestFrontier.hCost < startNode.hCost + allowedBacktrack) {
                 return new PathResult(reconstructPath(bestFrontier), false, true);
             }
         }
 
-        // إذا فرغت المجموعة المفتوحة تماماً فهذا يعني أن الهدف محاصر أو مسدود بالكامل (نهاية مسدودة)
-        if (opts.returnPartialOnBlocked() && bestNode != startNode) {
+        if (bestNode != startNode && (opts.returnPartialOnBlocked() || (startDist > 22.0 && bestNode.hCost < startNode.hCost - 1.5))) {
             return new PathResult(reconstructPath(bestNode), false, true);
         }
 
@@ -189,12 +192,13 @@ public class FarmPathfinder {
             BlockPos candidate,
             double stepCost,
             BlockPos goal,
+            double heuristicWeight,
             Map<BlockPos, PathNode> allNodes,
             PriorityQueue<PathNode> openSet) {
         double tentativeGCost = current.gCost + stepCost;
         PathNode neighbor = allNodes.get(candidate);
         if (neighbor == null || tentativeGCost < neighbor.gCost) {
-            PathNode nextNode = new PathNode(candidate, current, tentativeGCost, distance(candidate, goal));
+            PathNode nextNode = new PathNode(candidate, current, tentativeGCost, distance(candidate, goal), heuristicWeight);
             allNodes.put(candidate, nextNode);
             openSet.add(nextNode);
         }
@@ -629,16 +633,18 @@ public class FarmPathfinder {
         PathNode parent;
         double gCost;
         double hCost;
+        double heuristicWeight;
 
-        PathNode(BlockPos pos, PathNode parent, double gCost, double hCost) {
+        PathNode(BlockPos pos, PathNode parent, double gCost, double hCost, double heuristicWeight) {
             this.pos = pos;
             this.parent = parent;
             this.gCost = gCost;
             this.hCost = hCost;
+            this.heuristicWeight = heuristicWeight;
         }
 
         double fCost() {
-            return gCost + hCost;
+            return gCost + hCost * heuristicWeight;
         }
 
         @Override

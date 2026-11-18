@@ -1,6 +1,7 @@
 package com.helpermod.bot;
 import com.helpermod.bot.combat.BotCombatManager;
 import com.helpermod.bot.food.BotFoodManager;
+import com.helpermod.bot.hunt.MobHuntController;
 import com.helpermod.bot.path.BotNavigator;
 import com.helpermod.bot.path.FarmPathfinder;
 
@@ -74,6 +75,10 @@ public class BotFollowController {
     private int followEatSuppressionTicks = 0;
     private int preEatWeaponSlot = -1;
 
+    // آخر موضع معلوم للقائد للتحرك نحوه حتى إذا خرج عن مدى تتبع الكيانات المؤقت (مثل 200+ بلوكة)
+    private Vec3 lastKnownCompanionPos = null;
+    private String lastKnownCompanionDim = null;
+
     // حالة النوم بجانب القائد عند استلقائه وتوفر سرير قريب متاح
     private BlockPos targetSleepBedPos = null;
     private int sleepScanCooldown = 0;
@@ -93,6 +98,10 @@ public class BotFollowController {
 
     public String getTargetPlayerName() {
         return targetPlayerName;
+    }
+
+    public boolean isSleepingWithCompanion() {
+        return sleepingWithCompanion;
     }
 
     public UUID getTargetPlayerUUID() {
@@ -137,15 +146,20 @@ public class BotFollowController {
         this.hungryAlertCooldown = 0;
         this.followEatSuppressionTicks = 0;
         this.preEatWeaponSlot = -1;
+        this.lastKnownCompanionPos = null;
+        this.lastKnownCompanionDim = null;
         this.resetSleepState();
 
         // تصفير أي قتال أو دفاع معلق في الكنترولر القتالي
         BotCombatManager.getInstance().resetCombat(client);
         FightBotController.getInstance().stopDefending(client);
 
-        // إيقاف بوت المزرعة لمنع أي تضارب حركي
+        // إيقاف بوت المزرعة أو صيد الموبات لمنع أي تضارب حركي
         if (FarmBotController.getInstance().isFarming()) {
             FarmBotController.getInstance().stop(client);
+        }
+        if (MobHuntController.getInstance().isHunting()) {
+            MobHuntController.getInstance().stop(client);
         }
 
         if (client != null && client.level != null) {
@@ -161,6 +175,22 @@ public class BotFollowController {
                 client.player.sendSystemMessage(Component.literal("§e[Bot] تنبيه: الوضع العام للمود متوقف حالياً (/bot mode off). فعّله عبر: §b/bot mode on"));
             }
         }
+        BotGlobalManager.getInstance().clearUserControlPause();
+    }
+
+    /**
+     * تعليق حركة وقتال الاتباع مؤقتاً عند تدخل المستخدم دون إلغاء المتابعة.
+     */
+    public void pauseForUserControl(Minecraft client) {
+        if (!following) return;
+        this.currentState = FollowState.FLEXIBLE_ESCORT;
+        this.companionAnchorPos = null;
+        this.navigator.reset(client);
+        this.isEatingWhileFollowing = false;
+        this.followEatingTicks = 0;
+        this.lastFollowFoodLevel = -1;
+        this.preEatWeaponSlot = -1;
+        BotCombatManager.getInstance().resetCombat(client);
     }
 
     /**
@@ -180,6 +210,8 @@ public class BotFollowController {
         this.hungryAlertCooldown = 0;
         this.followEatSuppressionTicks = 0;
         this.preEatWeaponSlot = -1;
+        this.lastKnownCompanionPos = null;
+        this.lastKnownCompanionDim = null;
         if (client != null && client.player != null && sleepingWithCompanion && client.player.isSleeping()) {
             client.player.stopSleepInBed(true, true);
             restorePostSleepWeapon(client.player, client.gameMode);
@@ -226,16 +258,36 @@ public class BotFollowController {
         navigator.tickCooldowns();
 
         Player companion = findTargetPlayer(level);
+        String currentDim = FarmAreaManager.resolveDimensionId(level);
         if (companion == null) {
             if (sleepingWithCompanion && player.isSleeping()) {
                 player.stopSleepInBed(true, true);
                 restorePostSleepWeapon(player, gameMode);
             }
             resetSleepState();
+
+            if (lastKnownCompanionPos != null && currentDim.equals(lastKnownCompanionDim)) {
+                double remDistSq = player.position().distanceToSqr(lastKnownCompanionPos);
+                if (remDistSq > 4.0 * 4.0) {
+                    BotNavigator.NavResult navRes = navigator.navigateTo(
+                        client, player, level, gameMode, lastKnownCompanionPos, true, 3.0,
+                        isEatingWhileFollowing, 45.0f, true, 6000,
+                        FarmPathfinder.PathOptions.COMBAT_FOLLOW, false, true, lastKnownCompanionPos
+                    );
+                    if (navRes != BotNavigator.NavResult.MOVING) {
+                        lastKnownCompanionPos = null;
+                        releaseMovement(client);
+                    }
+                    return;
+                }
+                lastKnownCompanionPos = null;
+            }
             releaseMovement(client);
             return;
         }
         this.targetPlayerUUID = companion.getUUID();
+        this.lastKnownCompanionPos = companion.position();
+        this.lastKnownCompanionDim = currentDim;
 
         if (hungryAlertCooldown > 0) hungryAlertCooldown--;
         if (followEatSuppressionTicks > 0) followEatSuppressionTicks--;
@@ -399,7 +451,7 @@ public class BotFollowController {
 
                 Vec3 targetPos = companion.position();
                 navigator.navigateTo(
-                    client, player, level, gameMode, targetPos, true, 2.5, isEatingWhileFollowing, 45.0f, true, 4000,
+                    client, player, level, gameMode, targetPos, true, 2.5, isEatingWhileFollowing, 45.0f, true, 6000,
                     FarmPathfinder.PathOptions.COMBAT_FOLLOW, false, true, companion.position()
                 );
                 break;

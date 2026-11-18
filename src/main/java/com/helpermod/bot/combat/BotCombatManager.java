@@ -2,6 +2,7 @@ package com.helpermod.bot.combat;
 
 import com.helpermod.bot.BotEquipmentHelper;
 import com.helpermod.bot.BotFollowController;
+import com.helpermod.bot.BotSettingsManager;
 import com.helpermod.bot.friend.BotFriendManager;
 import com.helpermod.bot.path.BotNavigator;
 import net.minecraft.client.Minecraft;
@@ -11,15 +12,19 @@ import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.NeutralMob;
 import net.minecraft.world.entity.TamableAnimal;
 import net.minecraft.world.entity.monster.Creeper;
+import net.minecraft.world.entity.monster.EnderMan;
 import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.entity.projectile.Projectile;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.*;
@@ -47,6 +52,9 @@ public class BotCombatManager {
     private final Map<UUID, Integer> hostileTargets = new HashMap<>();
     // مؤقت حظر مؤقت للأهداف التي يتعذر الوصول إليها عبر A* (خلف جدار أو هاوية)
     private final Map<UUID, Integer> unreachableTargets = new HashMap<>();
+    // سجل الموبات المحظورة في وضع الاتباع التي قام القائد نفسه بالهجوم عليها (تُقاتَل مؤقتاً حتى تنتهي المعركة)
+    private final Map<UUID, Integer> companionProvokedTargets = new HashMap<>();
+    private int companionAttackGraceTicks = 0;
     private final BotNavigator combatNavigator = new BotNavigator();
 
     // نظام تثبيت الهدف لمنع التوهان بين الأعداء (Target Focus & Lock-in)
@@ -106,6 +114,7 @@ public class BotCombatManager {
         if (armorCheckCooldown > 0) armorCheckCooldown--;
         if (targetLockTicks > 0) targetLockTicks--;
         if (weaponChoiceLockTicks > 0) weaponChoiceLockTicks--;
+        if (companionAttackGraceTicks > 0) companionAttackGraceTicks--;
         combatNavigator.tickCooldowns();
 
         // صيانة الدروع وتوتم البقاء باستمرار دون تعطيل سحب السلاح أو الأكل
@@ -246,6 +255,7 @@ public class BotCombatManager {
 
         // 3. تحديد نوع السلاح التكتيكي مع مراعاة حماية القائد والحلفاء من ضربة Sweeping Edge
         WeaponMode weaponMode = determineWeaponChoice(player, level, companion, enemy);
+        boolean avoidSwordSweep = hasFriendlyNearSweep(level, player, companion, enemy);
 
         if (weaponMode == WeaponMode.SWORD) {
             ensureBestSwordInMainHand(player, gameMode);
@@ -268,8 +278,8 @@ public class BotCombatManager {
             if (isFullyCharged) {
                 releaseShield(client, player, gameMode);
 
-                // أ) القتال بالسيف (SWORD): بدون قفز
-                if (weaponMode == WeaponMode.SWORD) {
+                // أ) القتال بالسيف (SWORD): بدون قفز إلا عند الحاجة لتفادي Sweep Edge بجانب موب محظور أو حليف ولا يتوفر فأس
+                if (weaponMode == WeaponMode.SWORD && !avoidSwordSweep) {
                     BotNavigator.releaseJumpOrMaintainWaterBuoyancy(client, player, level, enemy);
                     isJumpingForAxeCrit = false;
                     axeCritTicks = 0;
@@ -281,7 +291,7 @@ public class BotCombatManager {
                     checkEnemyDefeated(enemy);
                     client.options.keyUp.setDown(distToEnemy > 1.8 && !BotNavigator.isHazardOrDropAhead(level, player, enemy.getX() - player.getX(), enemy.getZ() - player.getZ()));
                 }
-                // ب) القتال بالفأس (AXE): قفزة Crit محسوبة عند السقوط
+                // ب) القتال بالفأس (AXE) أو ضربة ساقطة تفادياً للضربة الواسعة عند قرب الحلفاء/المحظورين:
                 else {
                     if (BotNavigator.isEntityInWater(level, player) || player.onClimbable()) {
                         smoothLookAt(player, enemy.getX(), enemy.getEyeY() - 0.15, enemy.getZ(), 50.0f);
@@ -404,22 +414,28 @@ public class BotCombatManager {
     }
 
     public WeaponMode determineWeaponChoice(LocalPlayer player, ClientLevel level, Player companion, LivingEntity primaryTarget) {
-        if (primaryTarget == null) return WeaponMode.AXE;
+        if (primaryTarget == null) return WeaponMode.SWORD;
 
-        // حماية فورية من Sweeping Edge إذا اقترب القائد أو كيان أليف حتى لو كان السلاح مثبتاً
+        boolean needShieldBreak = (primaryTarget instanceof Player otherPlayer && otherPlayer.isBlocking());
+        // حماية فورية من Sweeping Edge إذا اقترب القائد أو حليف أو موب محظور حتى لا يضربه البوت عرضياً
         boolean friendlyNearSweep = hasFriendlyNearSweep(level, player, companion, primaryTarget);
-        if (friendlyNearSweep && hasAxe(player)) {
+        if ((needShieldBreak || friendlyNearSweep) && hasAxe(player)) {
             currentWeaponChoice = WeaponMode.AXE;
             return WeaponMode.AXE;
         }
 
         if (weaponChoiceLockTicks > 0) {
-            return currentWeaponChoice;
+            boolean validLocked = (currentWeaponChoice == WeaponMode.SWORD && hasSword(player))
+                || (currentWeaponChoice == WeaponMode.AXE && hasAxe(player));
+            if (validLocked) {
+                return currentWeaponChoice;
+            }
         }
 
-        List<LivingEntity> nearbyHostiles = getNearbyHostiles(level, player, 5.0);
+        List<LivingEntity> nearbyHostiles = getNearbyHostiles(level, player, companion, 5.0);
 
-        WeaponMode chosen = WeaponMode.AXE;
+        WeaponMode chosen;
+        boolean groupSwordSweep = false;
         if (!friendlyNearSweep && nearbyHostiles.size() >= 2) {
             Vec3 botPos = player.position();
             Vec3 botLook = player.getViewVector(1.0f);
@@ -432,24 +448,25 @@ public class BotCombatManager {
                     enemiesInSameDir++;
                 }
             }
+            groupSwordSweep = enemiesInSameDir >= 2 && hasSword(player);
+        }
 
-            if (enemiesInSameDir >= 2 && hasSword(player)) {
-                chosen = WeaponMode.SWORD;
-            } else if (hasAxe(player)) {
-                chosen = WeaponMode.AXE;
-            } else {
-                chosen = hasSword(player) ? WeaponMode.SWORD : WeaponMode.AXE;
-            }
+        if (groupSwordSweep) {
+            chosen = WeaponMode.SWORD;
         } else {
-            if (hasAxe(player)) {
-                chosen = WeaponMode.AXE;
+            int swordScore = BotEquipmentHelper.getBestSwordScore(player, false);
+            int axeScore = BotEquipmentHelper.getBestAxeScore(player, false);
+            if (swordScore <= 0 && axeScore <= 0) {
+                chosen = WeaponMode.SWORD;
+            } else if (swordScore >= axeScore) {
+                chosen = WeaponMode.SWORD;
             } else {
-                chosen = hasSword(player) ? WeaponMode.SWORD : WeaponMode.AXE;
+                chosen = WeaponMode.AXE;
             }
         }
 
         currentWeaponChoice = chosen;
-        weaponChoiceLockTicks = 30;
+        weaponChoiceLockTicks = 20;
         return chosen;
     }
 
@@ -460,10 +477,11 @@ public class BotCombatManager {
         AABB area = player.getBoundingBox().inflate(4.0);
         for (LivingEntity le : level.getEntitiesOfClass(LivingEntity.class, area)) {
             if (le == player || le == primaryTarget || !le.isAlive() || le.isRemoved()) continue;
-            boolean friendly = (companion != null && le == companion)
+            boolean protectedEntity = (companion != null && le == companion)
                 || (le instanceof Player p && (BotFriendManager.getInstance().isFriend(p) || BotFollowController.getInstance().isFollowingPlayer(p)))
-                || (le instanceof TamableAnimal tamed && tamed.isTame());
-            if (!friendly) continue;
+                || (le instanceof TamableAnimal tamed && tamed.isTame())
+                || isBlockedByFollowBan(le);
+            if (!protectedEntity) continue;
 
             if (le.distanceTo(primaryTarget) <= 2.6) {
                 return true;
@@ -497,7 +515,9 @@ public class BotCombatManager {
         }
 
         if (creeperState == CreeperCombatState.APPROACH_AND_STRIKE) {
-            ensureBestAxeInMainHand(player, gameMode);
+            if (!ensureBestAxeInMainHand(player, gameMode)) {
+                ensureBestSwordInMainHand(player, gameMode);
+            }
             releaseShield(client, player, gameMode);
 
             boolean isSwelling = creeper.getSwellDir() > 0;
@@ -676,7 +696,7 @@ public class BotCombatManager {
             double minEyeDist = 2.95;
             for (UUID uuid : hostileTargets.keySet()) {
                 LivingEntity target = findLivingEntityByUUID(level, player, uuid);
-                if (target != null && target.isAlive() && !target.isRemoved() && !target.isDeadOrDying() && target.getHealth() > 0 && !isFriendOrCompanion(target, player)) {
+                if (target != null && target.isAlive() && !target.isRemoved() && !target.isDeadOrDying() && target.getHealth() > 0 && !isFriendOrCompanion(target, player) && !isBlockedByFollowBan(target)) {
                     double eyeDist = BotEquipmentHelper.getEyeToHitboxDistance(player, target);
                     if (eyeDist <= minEyeDist && player.distanceTo(target) <= 3.6 && player.hasLineOfSight(target)) {
                         minEyeDist = eyeDist;
@@ -690,7 +710,7 @@ public class BotCombatManager {
         // 1. إن كان هناك هدف مثبت وما زال في مدى الاشتباك والتركيز ومكشوفاً وغير محظور الوصول:
         if (lockedTargetUUID != null && targetLockTicks > 0) {
             LivingEntity current = findLivingEntityByUUID(level, player, lockedTargetUUID);
-            if (current != null && current.isAlive() && !current.isRemoved() && !current.isDeadOrDying() && current.getHealth() > 0 && !isFriendOrCompanion(current, player)) {
+            if (current != null && current.isAlive() && !current.isRemoved() && !current.isDeadOrDying() && current.getHealth() > 0 && !isFriendOrCompanion(current, player) && !isBlockedByFollowBan(current)) {
                 boolean blocked = unreachableTargets.containsKey(current.getUUID())
                     && BotEquipmentHelper.getEyeToHitboxDistance(player, current) > 2.95;
                 if (!blocked && player.distanceTo(current) <= 16.0 && player.hasLineOfSight(current)) {
@@ -714,6 +734,10 @@ public class BotCombatManager {
             }
             LivingEntity target = findLivingEntityByUUID(level, player, uuid);
             if (target == null || target == player || target.getId() == player.getId() || target.isRemoved() || !target.isAlive() || target.isDeadOrDying() || target.getHealth() <= 0 || isFriendOrCompanion(target, player)) {
+                it.remove();
+                continue;
+            }
+            if (isBlockedByFollowBan(target)) {
                 it.remove();
                 continue;
             }
@@ -749,7 +773,7 @@ public class BotCombatManager {
         double bestDistSq = 16.0 * 16.0;
         for (UUID uuid : hostileTargets.keySet()) {
             LivingEntity target = findLivingEntityByUUID(level, player, uuid);
-            if (target != null && target.isAlive() && !target.isRemoved() && !target.isDeadOrDying() && target.getHealth() > 0 && !isFriendOrCompanion(target, player)) {
+            if (target != null && target.isAlive() && !target.isRemoved() && !target.isDeadOrDying() && target.getHealth() > 0 && !isFriendOrCompanion(target, player) && !isBlockedByFollowBan(target)) {
                 boolean blocked = unreachableTargets.containsKey(uuid)
                     && BotEquipmentHelper.getEyeToHitboxDistance(player, target) > 2.95;
                 if (!blocked && player.hasLineOfSight(target)) {
@@ -769,12 +793,8 @@ public class BotCombatManager {
         return nextTarget;
     }
 
-    /**
-     * تحديث سجل الأعداء والتهديدات المحيطة
-     */
-    private void updateHostilityRegistry(Minecraft client, LocalPlayer player, ClientLevel level, Player companion) {
-        // إنقاص مدة صلاحية الأعداء المسجلين
-        Iterator<Map.Entry<UUID, Integer>> it = hostileTargets.entrySet().iterator();
+    private static void decrementExpiringUuids(Map<UUID, Integer> map) {
+        Iterator<Map.Entry<UUID, Integer>> it = map.entrySet().iterator();
         while (it.hasNext()) {
             Map.Entry<UUID, Integer> entry = it.next();
             int remaining = entry.getValue() - 1;
@@ -784,19 +804,120 @@ public class BotCombatManager {
                 entry.setValue(remaining);
             }
         }
+    }
+
+    public void purgeFollowBannedTargets() {
+        Minecraft mc = Minecraft.getInstance();
+        ClientLevel level = mc != null ? mc.level : null;
+        LocalPlayer player = mc != null ? mc.player : null;
+        if (level != null && player != null) {
+            hostileTargets.keySet().removeIf(uuid -> {
+                LivingEntity e = findLivingEntityByUUID(level, player, uuid);
+                return e != null && BotSettingsManager.getInstance().isFollowMobBanned(e);
+            });
+            companionProvokedTargets.keySet().removeIf(uuid -> {
+                LivingEntity e = findLivingEntityByUUID(level, player, uuid);
+                return e != null && BotSettingsManager.getInstance().isFollowMobBanned(e);
+            });
+            if (lockedTargetUUID != null) {
+                LivingEntity locked = findLivingEntityByUUID(level, player, lockedTargetUUID);
+                if (locked != null && BotSettingsManager.getInstance().isFollowMobBanned(locked)) {
+                    lockedTargetUUID = null;
+                    targetLockTicks = 0;
+                }
+            }
+        } else {
+            hostileTargets.clear();
+            companionProvokedTargets.clear();
+            lockedTargetUUID = null;
+            targetLockTicks = 0;
+        }
+    }
+
+    private boolean isBlockedByFollowBan(LivingEntity entity) {
+        if (entity == null) return false;
+        if (!BotSettingsManager.getInstance().isFollowMobBanned(entity)) {
+            return false;
+        }
+        return !companionProvokedTargets.containsKey(entity.getUUID());
+    }
+
+    private void detectCompanionDirectAttacks(Minecraft client, LocalPlayer player, ClientLevel level, Player companion) {
+        if (companion == null || level == null) return;
+        Vec3 compEye = companion.getEyePosition();
+        Vec3 compLook = companion.getViewVector(1.0f);
+
+        // 1. رصد الهجوم القريب المباشر من القائد فقط (مع التحقق من خط النظر وعدم حجب ببلوك أو تلويح تعدين)
+        AABB meleeBox = companion.getBoundingBox().inflate(5.0);
+        for (LivingEntity candidate : level.getEntitiesOfClass(LivingEntity.class, meleeBox)) {
+            if (candidate == player || candidate == companion || !candidate.isAlive() || candidate.isRemoved()) continue;
+            if (isFriendOrCompanion(candidate, player)) continue;
+
+            boolean freshHit = candidate.hurtTime > 0 && candidate.hurtTime >= Math.max(1, candidate.hurtDuration - 2);
+            boolean attributed = (candidate.getLastHurtByMob() == companion || candidate.getLastHurtByPlayer() == companion)
+                && candidate.hurtTime > 0;
+            boolean inferredMeleeHit = false;
+            if (!attributed && companionAttackGraceTicks > 0 && freshHit
+                    && BotEquipmentHelper.getEyeToHitboxDistance(companion, candidate) <= 3.6) {
+                Vec3 rayEnd = compEye.add(compLook.scale(4.0));
+                Optional<Vec3> boxHit = candidate.getBoundingBox().inflate(0.3).clip(compEye, rayEnd);
+                if (boxHit.isPresent()) {
+                    HitResult blockHit = level.clip(new ClipContext(
+                        compEye, boxHit.get(), ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, companion
+                    ));
+                    inferredMeleeHit = blockHit.getType() == HitResult.Type.MISS;
+                }
+            }
+            if (attributed || inferredMeleeHit) {
+                companionProvokedTargets.put(candidate.getUUID(), 600);
+                registerHostileTarget(client, player, candidate);
+            }
+        }
+
+        // 2. رصد إصابة القائد للموب بسهم أو مقذوف متحرك فعلياً (استبعاد الأسهم المغروسة بالأرض)
+        AABB projBox = companion.getBoundingBox().inflate(24.0);
+        for (Projectile proj : level.getEntitiesOfClass(Projectile.class, projBox)) {
+            if (!proj.isAlive() || proj.isRemoved() || proj.onGround() || proj.getOwner() != companion) continue;
+            if (proj.getDeltaMovement().lengthSqr() < 0.01) continue;
+            AABB impactBox = proj.getBoundingBox().inflate(0.75);
+            for (LivingEntity candidate : level.getEntitiesOfClass(LivingEntity.class, impactBox)) {
+                if (candidate == player || candidate == companion || !candidate.isAlive() || candidate.isRemoved()) continue;
+                if (isFriendOrCompanion(candidate, player)) continue;
+                boolean freshHit = candidate.hurtTime > 0 && candidate.hurtTime >= Math.max(1, candidate.hurtDuration - 2);
+                if (freshHit && impactBox.intersects(candidate.getBoundingBox())) {
+                    companionProvokedTargets.put(candidate.getUUID(), 600);
+                    registerHostileTarget(client, player, candidate);
+                }
+            }
+        }
+    }
+
+    /**
+     * تحديث سجل الأعداء والتهديدات المحيطة
+     */
+    private void updateHostilityRegistry(Minecraft client, LocalPlayer player, ClientLevel level, Player companion) {
+        // إنقاص مدة صلاحية الأعداء المسجلين والموبات المستثارة من القائد
+        decrementExpiringUuids(hostileTargets);
+        decrementExpiringUuids(companionProvokedTargets);
 
         boolean compDamaged = false;
         if (companion != null) {
             float compHealth = companion.getHealth();
             compDamaged = companion.hurtTime > 0 || (lastCompanionHealth > 0 && compHealth < lastCompanionHealth - 0.01f);
+            boolean compSwingFresh = companion.swinging && companion.swingTime <= 2 && !companion.isUsingItem();
             boolean compAttacking = companion.swinging || companion.swingTime > 0 || companion.attackAnim > 0;
+            if (compSwingFresh) {
+                companionAttackGraceTicks = 4;
+            }
+
+            detectCompanionDirectAttacks(client, player, level, companion);
 
             if (compDamaged || compAttacking) {
                 scanAndEnlistEnemies(client, player, level, companion, companion.position());
             }
             LivingEntity compHurtBy = companion.getLastHurtByMob();
             if (compDamaged && compHurtBy != null && !isFriendOrCompanion(compHurtBy, player)
-                && (isHostileMob(compHurtBy) || compHurtBy instanceof Player)) {
+                && (isHostileMob(compHurtBy, player, companion) || compHurtBy instanceof Player)) {
                 registerHostileTarget(client, player, compHurtBy);
             }
             lastCompanionHealth = compHealth;
@@ -808,7 +929,7 @@ public class BotCombatManager {
             scanAndEnlistEnemies(client, player, level, companion, player.position());
             LivingEntity botHurtBy = player.getLastHurtByMob();
             if (botHurtBy != null && !isFriendOrCompanion(botHurtBy, player)
-                && (isHostileMob(botHurtBy) || botHurtBy instanceof Player)) {
+                && (isHostileMob(botHurtBy, player, companion) || botHurtBy instanceof Player)) {
                 registerHostileTarget(client, player, botHurtBy);
             }
         }
@@ -819,7 +940,7 @@ public class BotCombatManager {
         if (incoming != null) {
             arrowDefenseCooldown = 12;
             if (incoming.getOwner() instanceof LivingEntity shooter && !isFriendOrCompanion(shooter, player)
-                && (isHostileMob(shooter) || shooter instanceof Player)) {
+                && (isHostileMob(shooter, player, companion) || shooter instanceof Player)) {
                 registerHostileTarget(client, player, shooter);
             }
         }
@@ -879,7 +1000,9 @@ public class BotCombatManager {
 
     private void scanAndEnlistEnemies(Minecraft client, LocalPlayer player, ClientLevel level, Player companion, Vec3 center) {
         AABB box = new AABB(center.x - 16.0, center.y - 5.0, center.z - 16.0, center.x + 16.0, center.y + 5.0, center.z + 16.0);
-        List<LivingEntity> list = level.getEntitiesOfClass(LivingEntity.class, box, e -> e != player && e != companion && e.isAlive() && !e.isRemoved() && !isFriendOrCompanion(e, player) && isHostileMob(e));
+        List<LivingEntity> list = level.getEntitiesOfClass(LivingEntity.class, box,
+            e -> e != player && e != companion && e.isAlive() && !e.isRemoved() && !isFriendOrCompanion(e, player)
+                && isHostileMob(e, player, companion) && !isBlockedByFollowBan(e));
         for (LivingEntity hostile : list) {
             registerHostileTarget(client, player, hostile);
         }
@@ -888,13 +1011,16 @@ public class BotCombatManager {
     public void registerHostileTarget(Minecraft client, LocalPlayer player, LivingEntity entity) {
         if (entity == null || entity == player || entity.getId() == player.getId() || isFriendOrCompanion(entity, player)) return;
         if (!entity.isAlive() || entity.isRemoved()) return;
+        if (isBlockedByFollowBan(entity)) return;
         UUID uuid = entity.getUUID();
         hostileTargets.put(uuid, 600); // 30 ثانية
     }
 
-    private List<LivingEntity> getNearbyHostiles(ClientLevel level, LocalPlayer player, double radius) {
+    private List<LivingEntity> getNearbyHostiles(ClientLevel level, LocalPlayer player, Player companion, double radius) {
         AABB box = player.getBoundingBox().inflate(radius);
-        return level.getEntitiesOfClass(LivingEntity.class, box, e -> e != player && e.isAlive() && !e.isRemoved() && !isFriendOrCompanion(e, player) && isHostileMob(e));
+        return level.getEntitiesOfClass(LivingEntity.class, box,
+            e -> e != player && e.isAlive() && !e.isRemoved() && !isFriendOrCompanion(e, player)
+                && isHostileMob(e, player, companion) && !isBlockedByFollowBan(e));
     }
 
     private Projectile findIncomingProjectile(ClientLevel level, LocalPlayer player, Player companion) {
@@ -923,6 +1049,7 @@ public class BotCombatManager {
         if (!enemy.isAlive() || enemy.isRemoved() || enemy.isDeadOrDying() || enemy.getHealth() <= 0) {
             hostileTargets.remove(enemy.getUUID());
             unreachableTargets.remove(enemy.getUUID());
+            companionProvokedTargets.remove(enemy.getUUID());
             if (lockedTargetUUID != null && lockedTargetUUID.equals(enemy.getUUID())) {
                 lockedTargetUUID = null;
                 targetLockTicks = 0;
@@ -934,6 +1061,8 @@ public class BotCombatManager {
     public void resetCombat(Minecraft client) {
         hostileTargets.clear();
         unreachableTargets.clear();
+        companionProvokedTargets.clear();
+        companionAttackGraceTicks = 0;
         rangedHelper.reset(client);
         combatNavigator.reset(client);
         lockedTargetUUID = null;
@@ -975,11 +1104,11 @@ public class BotCombatManager {
     }
 
     public boolean ensureBestSwordInMainHand(LocalPlayer player, MultiPlayerGameMode gameMode) {
-        return BotEquipmentHelper.ensureBestInMainHand(player, gameMode, BotEquipmentHelper::getSwordTier, 1, 0);
+        return BotEquipmentHelper.ensureBestSwordInMainHand(player, gameMode, false, 0);
     }
 
     public boolean ensureBestAxeInMainHand(LocalPlayer player, MultiPlayerGameMode gameMode) {
-        return BotEquipmentHelper.ensureBestInMainHand(player, gameMode, BotEquipmentHelper::getAxeTier, 1, 0);
+        return BotEquipmentHelper.ensureBestAxeInMainHand(player, gameMode, false, 0);
     }
 
     public void ensureShieldInOffhand(LocalPlayer player, MultiPlayerGameMode gameMode) {
@@ -1044,7 +1173,27 @@ public class BotCombatManager {
         return false;
     }
 
-    private boolean isHostileMob(LivingEntity entity) {
+    public static boolean isNeutralMobActivelyHostile(LivingEntity entity, LocalPlayer player, Player companion) {
+        if (entity instanceof Mob mob) {
+            if (mob.isAggressive()) return true;
+            LivingEntity target = mob.getTarget();
+            if (target != null && (target == player || (companion != null && target == companion))) {
+                return true;
+            }
+        }
+        if (entity instanceof EnderMan enderman && enderman.isCreepy()) {
+            return true;
+        }
+        if (player != null && player.getLastHurtByMob() == entity && player.hurtTime > 0) {
+            return true;
+        }
+        return companion != null && companion.getLastHurtByMob() == entity && companion.hurtTime > 0;
+    }
+
+    private boolean isHostileMob(LivingEntity entity, LocalPlayer player, Player companion) {
+        if (entity instanceof NeutralMob) {
+            return isNeutralMobActivelyHostile(entity, player, companion);
+        }
         if (entity instanceof Enemy || entity instanceof Monster) return true;
         if (entity instanceof Mob mob) {
             String name = mob.getType().getDescriptionId().toLowerCase();

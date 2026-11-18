@@ -142,7 +142,7 @@ public class FarmAreaManager {
         return raw;
     }
 
-    private static String makeScopeKey(String worldKey, String dimensionId) {
+    public static String makeScopeKey(String worldKey, String dimensionId) {
         if (worldKey == null || worldKey.isBlank() || dimensionId == null || dimensionId.isBlank()) {
             return null;
         }
@@ -292,6 +292,7 @@ public class FarmAreaManager {
         this.awaitingChestAppend = append;
         if (this.awaitingChestFarmName != null) {
             this.awaitingFertilizerChest = false;
+            com.helpermod.bot.hunt.HuntConfigManager.getInstance().clearAwaitingChestSelection();
         }
     }
 
@@ -422,6 +423,7 @@ public class FarmAreaManager {
             this.awaitingChestFarmName = null;
             this.awaitingChestRole = FarmArea.ChestRole.CROP;
             this.awaitingChestAppend = false;
+            com.helpermod.bot.hunt.HuntConfigManager.getInstance().clearAwaitingChestSelection();
         }
     }
 
@@ -590,7 +592,7 @@ public class FarmAreaManager {
         return FabricLoader.getInstance().getConfigDir().resolve("helpermod_areas.json");
     }
 
-    private static JsonObject posToJson(BlockPos pos) {
+    public static JsonObject posToJson(BlockPos pos) {
         JsonObject obj = new JsonObject();
         obj.addProperty("x", pos.getX());
         obj.addProperty("y", pos.getY());
@@ -598,12 +600,12 @@ public class FarmAreaManager {
         return obj;
     }
 
-    private static BlockPos jsonToPos(JsonObject obj) {
+    public static BlockPos jsonToPos(JsonObject obj) {
         if (obj == null || !obj.has("x") || !obj.has("y") || !obj.has("z")) return null;
         return new BlockPos(obj.get("x").getAsInt(), obj.get("y").getAsInt(), obj.get("z").getAsInt());
     }
 
-    private static JsonArray posListToJson(List<BlockPos> list) {
+    public static JsonArray posListToJson(List<BlockPos> list) {
         JsonArray arr = new JsonArray();
         for (BlockPos pos : list) {
             if (pos != null) {
@@ -613,15 +615,38 @@ public class FarmAreaManager {
         return arr;
     }
 
-    private static void loadChestArray(JsonObject obj, String key, FarmArea area, FarmArea.ChestRole role) {
-        if (!obj.has(key) || !obj.get(key).isJsonArray()) return;
+    public static List<BlockPos> readPosList(JsonObject obj, String key) {
+        List<BlockPos> result = new ArrayList<>();
+        if (obj == null || !obj.has(key) || !obj.get(key).isJsonArray()) {
+            return result;
+        }
         for (JsonElement el : obj.getAsJsonArray(key)) {
             if (el.isJsonObject()) {
                 BlockPos pos = jsonToPos(el.getAsJsonObject());
                 if (pos != null) {
-                    area.addChest(role, pos);
+                    result.add(pos.immutable());
                 }
             }
+        }
+        return result;
+    }
+
+    public static void atomicWriteJson(Path file, JsonObject root) throws java.io.IOException {
+        Files.createDirectories(file.getParent());
+        Path tempFile = file.resolveSibling(file.getFileName().toString() + ".tmp");
+        try (Writer writer = Files.newBufferedWriter(tempFile)) {
+            GSON.toJson(root, writer);
+        }
+        try {
+            Files.move(tempFile, file, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } catch (java.io.IOException e) {
+            Files.move(tempFile, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private static void loadChestArray(JsonObject obj, String key, FarmArea area, FarmArea.ChestRole role) {
+        for (BlockPos pos : readPosList(obj, key)) {
+            area.addChest(role, pos);
         }
     }
 

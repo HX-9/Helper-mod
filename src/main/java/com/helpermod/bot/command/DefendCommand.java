@@ -48,7 +48,7 @@ public final class DefendCommand {
         if (mode == FightBotController.DefenseMode.CAUTIOUS) {
             modeDesc = "§6نمط الحذر (مراقبة وصد بالدرع وتراجع عند الخطر)";
         } else if (mode == FightBotController.DefenseMode.COMBAT) {
-            modeDesc = "§4نمط القتال (حماية وهجوم وقتل الوحوش والهروب من الكريبر)";
+            modeDesc = "§4نمط القتال (حماية وهجوم وقتل الوحوش والهروب من Creeper)";
         } else {
             modeDesc = "§cمعطل";
         }
@@ -57,7 +57,7 @@ public final class DefendCommand {
         BotCommandHelpers.send(source, "§7الدرع المخصص للدفاع: " + (hasShield ? "§aمتوفر في الحقيبة/اليد وجاهز للتبديل الفوري عند الخطر" : "§cغير متوفر (يرجى وضع درع في الحقيبة للتبديل الفوري)"));
         BotCommandHelpers.send(source, "§eالأنماط المتاحة:");
         BotCommandHelpers.send(source, "  §a/bot defend cautious §7- نمط الحذر (مراقبة وصد وتراجع فقط)");
-        BotCommandHelpers.send(source, "  §c/bot defend combat   §7- نمط القتال (هجوم وقتل الوحوش والهروب من الكريبر)");
+        BotCommandHelpers.send(source, "  §c/bot defend combat   §7- نمط القتال (هجوم وقتل الوحوش والهروب من Creeper)");
         BotCommandHelpers.send(source, "  §7/bot defend off      §7- إيقاف الدفاع بالكامل");
         return 1;
     }
